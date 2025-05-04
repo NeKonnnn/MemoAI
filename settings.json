@@ -1,0 +1,17 @@
+{
+  "models": [
+    {
+      "name": "model.gguf",
+      "path": "F:\\memoai\\models\\model.gguf",
+      "description": "Модель model.gguf"
+    },
+    {
+      "name": "Qwen_Qwen3-8B-Q8_0.gguf",
+      "path": "F:\\memoai\\models\\Qwen_Qwen3-8B-Q8_0.gguf",
+      "description": "Модель Qwen_Qwen3-8B-Q8_0.gguf"
+    }
+  ],
+  "current_model": "F:\\memoai\\models\\model.gguf",
+  "voice_speaker": "baya",
+  "theme": "dark"
+}
