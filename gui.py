@@ -15,9 +15,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, pyqtSignal, QThread, QDateTime
 from PyQt6.QtGui import QFont, QIcon, QColor, QTextCursor
 
+# Импорты для распознавания голоса
+from vosk import Model, KaldiRecognizer
+import sounddevice as sd
+
 from agent import ask_agent, update_model_settings, model_settings
 from memory import save_to_memory
-from voice import speak_text, check_vosk_model, VOSK_MODEL_PATH
+from voice import speak_text, check_vosk_model, VOSK_MODEL_PATH, SAMPLE_RATE
 from document_processor import DocumentProcessor
 from transcriber import Transcriber
 from online_transcription import OnlineTranscriber
@@ -47,7 +51,7 @@ class AgentThread(QThread):
         self.message = message
         self.for_voice = for_voice
         # Если streaming не указан явно, берем из настроек модели
-        self.streaming = streaming if streaming is not None else model_settings.get("streaming", False)
+        self.streaming = streaming if streaming is not None else model_settings.get("streaming", True)
         
     def run(self):
         try:
@@ -434,7 +438,7 @@ class ModelSettingsDialog(QDialog):
         # Потоковая генерация
         self.streaming_combo = QComboBox()
         self.streaming_combo.addItems(["Включена", "Выключена"])
-        self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", False) else 1)
+        self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", True) else 1)
         form_layout.addRow("Потоковая генерация:", self.streaming_combo)
         
         # Кнопки
@@ -474,7 +478,7 @@ class ModelSettingsDialog(QDialog):
         self.top_p_spin.setValue(0.95)
         self.repeat_penalty_spin.setValue(1.05)
         self.verbose_combo.setCurrentIndex(0)
-        self.streaming_combo.setCurrentIndex(0)  # Потоковая генерация включена по умолчанию
+        self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", True) else 1)  # Потоковая генерация включена по умолчанию
     
     def get_settings(self):
         """Получение настроек из формы"""
@@ -1411,7 +1415,7 @@ class MainWindow(QMainWindow):
         self.streaming_active = False
         
         # Получаем настройку потоковой генерации
-        use_streaming = model_settings.get("streaming", False)
+        use_streaming = model_settings.get("streaming", True)
         
         # Если стриминг отключен, показываем индикатор загрузки
         if not use_streaming:
@@ -1488,7 +1492,7 @@ class MainWindow(QMainWindow):
         
         # Создаем поток для обработки сообщения
         # Получаем настройки из конфигурации
-        streaming = self.model_config.config.get("streaming", False)
+        streaming = self.model_config.config.get("streaming", True)
         self.agent_thread = AgentThread(self.signals, message, streaming=streaming)
         self.agent_thread.finished.connect(lambda: self.send_button.setEnabled(True))
         self.agent_thread.start()
@@ -1554,7 +1558,7 @@ class MainWindow(QMainWindow):
         self.streaming_active = False
         
         # Получаем настройку потоковой генерации
-        use_streaming = model_settings.get("streaming", False)
+        use_streaming = model_settings.get("streaming", True)
         
         # Если стриминг отключен, показываем индикатор загрузки
         if not use_streaming:
@@ -2015,6 +2019,7 @@ class MainWindow(QMainWindow):
 
     def handle_streaming_chunk(self, chunk, accumulated_text):
         """Обработка фрагмента потоковой генерации"""
+        print(f"DEBUG: Получен фрагмент: '{chunk}', полный текст: '{accumulated_text[:50]}...' (длина {len(accumulated_text)})")
         # Определяем, на какой вкладке происходит потоковая генерация
         current_tab_index = self.tabs.currentIndex()
         
@@ -2028,116 +2033,202 @@ class MainWindow(QMainWindow):
 
     def update_streaming_message_in_chat(self, chunk, accumulated_text):
         """Обновление потокового сообщения в текстовом чате"""
-        # Если это первый фрагмент сообщения
         if not self.streaming_active:
-            self.streaming_active = False
+            # Первый фрагмент сообщения - создаем новое сообщение
+            print(f"DEBUG: Создаем новое потоковое сообщение с текстом: '{accumulated_text[:50]}...'")
+            self.streaming_active = True
+            
             # Добавляем новое сообщение с начальным текстом
             color = "#009933"  # цвет для сообщений ассистента
             timestamp = QDateTime.currentDateTime().toString("HH:mm")
             
-            html = f'''
-            <div style="margin-bottom: 10px;">
-                <div style="white-space: pre-wrap;">
-                    <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> <span id="streaming-message">{chunk}</span>
-                </div>
+            # Удаляем сообщение "Ассистент печатает..." если оно есть
+            html = self.chat_history.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.chat_history.setHtml(html)
+            
+            # Создаем HTML для нового сообщения без использования id
+            new_message = f'''
+            <div class="message">
+                <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
+                {accumulated_text}
             </div>
             '''
             
             # Добавляем сообщение в историю чата
-            self.chat_history.append(html)
-            self.current_stream_message = chunk
-        else:
-            # Обновляем существующее сообщение
-            html = self.chat_history.toHtml()
+            self.chat_history.append(new_message)
             
-            # Заменяем содержимое span с id="streaming-message" на новый текст
-            updated_html = html.replace(
-                f'<span id="streaming-message">{self.current_stream_message}</span>', 
-                f'<span id="streaming-message">{accumulated_text}</span>'
-            )
-            
-            self.chat_history.setHtml(updated_html)
+            # Сохраняем текущий текст для последующих обновлений
             self.current_stream_message = accumulated_text
-            
-            # Прокручиваем до конца
-            cursor = self.chat_history.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self.chat_history.setTextCursor(cursor)
+        else:
+            # Последующие фрагменты - обновляем последнее сообщение
+            try:
+                print(f"DEBUG: Обновляем сообщение, новый текст длиной {len(accumulated_text)} символов")
+                
+                # Создаем новое сообщение с обновленным текстом
+                color = "#009933"
+                timestamp = QDateTime.currentDateTime().toString("HH:mm")
+                
+                new_message = f'''
+                <div class="message">
+                    <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
+                    {accumulated_text}
+                </div>
+                '''
+                
+                # Удаляем последний параграф и добавляем новый
+                cursor = self.chat_history.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
+                                   cursor.position())
+                cursor.removeSelectedText()
+                
+                # Вставляем обновленное сообщение
+                cursor.insertHtml(new_message)
+                
+                # Обновляем сохраненный текст
+                self.current_stream_message = accumulated_text
+                
+                # Прокручиваем вниз
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.chat_history.setTextCursor(cursor)
+            except Exception as e:
+                print(f"ОШИБКА при обновлении потокового сообщения: {str(e)}")
 
     def update_streaming_message_in_voice(self, chunk, accumulated_text):
         """Обновление потокового сообщения в голосовом чате"""
-        # Если это первый фрагмент сообщения
         if not self.streaming_active:
-            self.streaming_active = False
+            # Первый фрагмент сообщения - создаем новое сообщение
+            print(f"DEBUG: Создаем новое потоковое сообщение для голосового чата")
+            self.streaming_active = True
+            
             # Добавляем новое сообщение с начальным текстом
             color = "#009933"  # цвет для сообщений ассистента
             timestamp = QDateTime.currentDateTime().toString("HH:mm")
             
-            html = f'''
-            <div style="margin-bottom: 10px;">
-                <div style="white-space: pre-wrap;">
-                    <span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> <span id="streaming-voice-message">{chunk}</span>
-                </div>
+            # Удаляем сообщение "Ассистент печатает..." если оно есть
+            html = self.voice_history.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.voice_history.setHtml(html)
+            
+            # Создаем HTML для нового сообщения без использования id
+            new_message = f'''
+            <div class="message">
+                <span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> 
+                {accumulated_text}
             </div>
             '''
             
-            # Добавляем сообщение в историю голосового чата
-            self.voice_history.append(html)
-            self.current_stream_message = chunk
-        else:
-            # Обновляем существующее сообщение
-            html = self.voice_history.toHtml()
+            # Добавляем сообщение в историю чата
+            self.voice_history.append(new_message)
             
-            # Заменяем содержимое span с id="streaming-voice-message" на новый текст
-            updated_html = html.replace(
-                f'<span id="streaming-voice-message">{self.current_stream_message}</span>', 
-                f'<span id="streaming-voice-message">{accumulated_text}</span>'
-            )
-            
-            self.voice_history.setHtml(updated_html)
+            # Сохраняем текущий текст для последующих обновлений
             self.current_stream_message = accumulated_text
-            
-            # Прокручиваем до конца
-            cursor = self.voice_history.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self.voice_history.setTextCursor(cursor)
+        else:
+            # Последующие фрагменты - обновляем последнее сообщение
+            try:
+                print(f"DEBUG: Обновляем сообщение голосового чата")
+                
+                # Создаем новое сообщение с обновленным текстом
+                color = "#009933"
+                timestamp = QDateTime.currentDateTime().toString("HH:mm")
+                
+                new_message = f'''
+                <div class="message">
+                    <span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> 
+                    {accumulated_text}
+                </div>
+                '''
+                
+                # Удаляем последний параграф и добавляем новый
+                cursor = self.voice_history.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
+                                   cursor.position())
+                cursor.removeSelectedText()
+                
+                # Вставляем обновленное сообщение
+                cursor.insertHtml(new_message)
+                
+                # Обновляем сохраненный текст
+                self.current_stream_message = accumulated_text
+                
+                # Прокручиваем вниз
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.voice_history.setTextCursor(cursor)
+            except Exception as e:
+                print(f"ОШИБКА при обновлении потокового сообщения в голосовом чате: {str(e)}")
 
     def update_streaming_message_in_docs(self, chunk, accumulated_text):
         """Обновление потокового сообщения в чате документов"""
-        # Если это первый фрагмент сообщения
         if not self.streaming_active:
-            self.streaming_active = False
+            # Первый фрагмент сообщения - создаем новое сообщение
+            print(f"DEBUG: Создаем новое потоковое сообщение для чата документов")
+            self.streaming_active = True
+            
             # Добавляем новое сообщение с начальным текстом
             color = "#009933"  # цвет для сообщений ассистента
             timestamp = QDateTime.currentDateTime().toString("HH:mm")
             
+            # Удаляем сообщение "Ассистент печатает..." если оно есть
+            html = self.docs_chat_area.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.docs_chat_area.setHtml(html)
+            
+            # Создаем новое сообщение без использования id
             cursor = self.docs_chat_area.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
             
             # Форматируем HTML для сообщения
-            html = f'<p><span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> '
-            html += f'<span id="streaming-docs-message">{chunk}</span></p>'
+            new_message = f'''
+            <div class="message">
+                <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
+                {accumulated_text}
+            </div>
+            '''
             
             # Вставляем HTML
-            cursor.insertHtml(html)
-            self.current_stream_message = chunk
-        else:
-            # Обновляем существующее сообщение
-            html = self.docs_chat_area.toHtml()
+            cursor.insertHtml(new_message)
             
-            # Заменяем содержимое span с id="streaming-docs-message" на новый текст
-            updated_html = html.replace(
-                f'<span id="streaming-docs-message">{self.current_stream_message}</span>', 
-                f'<span id="streaming-docs-message">{accumulated_text}</span>'
-            )
-            
-            self.docs_chat_area.setHtml(updated_html)
+            # Сохраняем текущий текст для последующих обновлений
             self.current_stream_message = accumulated_text
-            
-            # Прокручиваем до конца
-            cursor = self.docs_chat_area.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self.docs_chat_area.setTextCursor(cursor)
+        else:
+            # Последующие фрагменты - обновляем последнее сообщение
+            try:
+                print(f"DEBUG: Обновляем сообщение в чате документов")
+                
+                # Создаем новое сообщение с обновленным текстом
+                color = "#009933"
+                timestamp = QDateTime.currentDateTime().toString("HH:mm")
+                
+                new_message = f'''
+                <div class="message">
+                    <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
+                    {accumulated_text}
+                </div>
+                '''
+                
+                # Удаляем последний параграф и добавляем новый
+                cursor = self.docs_chat_area.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
+                                   cursor.position())
+                cursor.removeSelectedText()
+                
+                # Вставляем обновленное сообщение
+                cursor.insertHtml(new_message)
+                
+                # Обновляем сохраненный текст
+                self.current_stream_message = accumulated_text
+                
+                # Прокручиваем вниз
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.docs_chat_area.setTextCursor(cursor)
+            except Exception as e:
+                print(f"ОШИБКА при обновлении потокового сообщения в чате документов: {str(e)}")
 
     def append_message(self, sender, message, error=False):
         """Добавление сообщения в историю чата"""
@@ -2223,8 +2314,7 @@ class MainWindow(QMainWindow):
                 self.voice_recognition_thread.pause()
             
             # Озвучиваем текст при помощи голосового синтезатора
-            voice = Voice(speaker)
-            voice.say(text)
+            speak_text(text, speaker=speaker)
             
             # Возобновляем распознавание, если оно было активно
             if self.recognition_active and self.voice_recognition_thread:
@@ -2243,6 +2333,9 @@ class MainWindow(QMainWindow):
         # Если распознавание голоса активно, останавливаем его
         if self.recognition_active:
             self.stop_voice_recognition()
+
+    def streaming_combo_changed(self, index):
+        self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", True) else 1)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

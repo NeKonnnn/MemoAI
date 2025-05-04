@@ -21,7 +21,7 @@ class ModelSettings:
             "top_p": 0.95,             # Top-p sampling
             "repeat_penalty": 1.05,    # Штраф за повторения
             "use_gpu": False,          # Использовать GPU
-            "streaming": False         # Использовать потоковую генерацию
+            "streaming": True         # Использовать потоковую генерацию
         }
         self.settings = self.default_settings.copy()
         self.load_settings()
@@ -185,12 +185,14 @@ def ask_agent(prompt, history=None, max_tokens=None, streaming=False, stream_cal
     # Формируем вход (можно добавить историю позже)
     try:
         print(f"[LLM] Получен запрос: {prompt.strip()[:50]}...")
+        print(f"[LLM] Режим потоковой генерации: {'включен' if streaming else 'выключен'}")
         
         # Используем правильный формат запроса
         full_prompt = prepare_prompt(prompt)
         
         # Если включен режим потоковой генерации
         if streaming and stream_callback:
+            print("[LLM] Запускаем потоковую генерацию")
             # Инициализируем переменную для накопления текста
             accumulated_text = ""
             
@@ -207,15 +209,32 @@ def ask_agent(prompt, history=None, max_tokens=None, streaming=False, stream_cal
             )
             
             # Обрабатываем каждый фрагмент
+            chunk_counter = 0
             for output in generator:
                 chunk = output["choices"][0]["text"]
                 accumulated_text += chunk
+                chunk_counter += 1
+                
+                if chunk_counter <= 3 or chunk_counter % 10 == 0:
+                    print(f"[LLM] Фрагмент {chunk_counter}: '{chunk}', длина: {len(chunk)}")
+                    if len(accumulated_text) <= 100:
+                        print(f"[LLM] Накопленный текст: '{accumulated_text}'")
+                    else:
+                        print(f"[LLM] Накопленный текст (первые 50 символов): '{accumulated_text[:50]}...'")
+                
                 # Вызываем колбэк с текущим фрагментом
                 stream_callback(chunk, accumulated_text)
+            
+            print(f"[LLM] Потоковая генерация завершена, всего фрагментов: {chunk_counter}")
+            if len(accumulated_text) <= 100:
+                print(f"[LLM] Итоговый текст: '{accumulated_text}'")
+            else:
+                print(f"[LLM] Итоговый текст (первые 100 символов): '{accumulated_text[:100]}...'")
             
             return accumulated_text
         else:
             # Обычная генерация без стриминга
+            print("[LLM] Запускаем обычную генерацию")
             output = llm(
                 full_prompt,
                 max_tokens=max_tokens,     # Размер ответа
@@ -228,9 +247,14 @@ def ask_agent(prompt, history=None, max_tokens=None, streaming=False, stream_cal
             
             generated_text = output["choices"][0]["text"].strip()
             
+            if len(generated_text) <= 100:
+                print(f"[LLM] Генерация завершена, результат: '{generated_text}'")
+            else:
+                print(f"[LLM] Генерация завершена, результат (первые 100 символов): '{generated_text[:100]}...'")
+            
             # Обрабатываем случай пустого вывода
             if not generated_text:
-                print("Модель вернула пустой ответ, пробуем повторно с другими параметрами...")
+                print("[LLM] Модель вернула пустой ответ, пробуем повторно с другими параметрами...")
                 # Более безопасные параметры для повторной попытки
                 output = llm(
                     prompt.strip(),  # Более простой формат
@@ -239,6 +263,11 @@ def ask_agent(prompt, history=None, max_tokens=None, streaming=False, stream_cal
                     echo=False
                 )
                 generated_text = output["choices"][0]["text"].strip()
+                
+                if len(generated_text) <= 100:
+                    print(f"[LLM] Повторная генерация завершена, результат: '{generated_text}'")
+                else:
+                    print(f"[LLM] Повторная генерация завершена, результат (первые 100 символов): '{generated_text[:100]}...'")
             
             return generated_text
     except Exception as e:
