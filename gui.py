@@ -9,13 +9,18 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QTextEdit, 
                             QLineEdit, QFileDialog, QMessageBox, QTabWidget,
                             QListWidget, QListWidgetItem, QFormLayout, QDialog,
-                            QFrame, QScrollArea, QComboBox, QSpinBox, QDoubleSpinBox)
+                            QFrame, QScrollArea, QComboBox, QSpinBox, QDoubleSpinBox,
+                            QCheckBox, QRadioButton, QButtonGroup, QProgressBar,
+                            QGroupBox, QSplitter)
 from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, pyqtSignal, QThread, QDateTime
 from PyQt6.QtGui import QFont, QIcon, QColor, QTextCursor
 
 from agent import ask_agent, update_model_settings, model_settings
 from memory import save_to_memory
 from voice import speak_text, check_vosk_model, VOSK_MODEL_PATH
+from document_processor import DocumentProcessor
+from transcriber import Transcriber
+from online_transcription import OnlineTranscriber
 
 # Константы
 CONFIG_FILE = "settings.json"
@@ -28,6 +33,10 @@ class Signals(QObject):
     voice_recognized = pyqtSignal(str)
     voice_error = pyqtSignal(str)
     voice_response_ready = pyqtSignal(str)
+    document_processed = pyqtSignal(bool, str)
+    transcription_complete = pyqtSignal(bool, str)
+    progress_update = pyqtSignal(int)
+    online_transcription_result = pyqtSignal(dict)
 
 # Класс для фонового получения ответов от модели
 class AgentThread(QThread):
@@ -55,76 +64,128 @@ class AgentThread(QThread):
             # Отправляем сигнал с ошибкой
             self.signals.error_occurred.emit(str(e))
 
-# Класс для распознавания речи в фоновом режиме
+# Класс для работы с документами в фоновом режиме
+class DocumentThread(QThread):
+    def __init__(self, signals, doc_processor, file_path=None, query=None):
+        super().__init__()
+        self.signals = signals
+        self.doc_processor = doc_processor
+        self.file_path = file_path
+        self.query = query
+        
+    def run(self):
+        if self.file_path:
+            # Обработка документа
+            success, message = self.doc_processor.process_document(self.file_path)
+            self.signals.document_processed.emit(success, message)
+        elif self.query:
+            # Запрос к документам
+            response = self.doc_processor.process_query(self.query, ask_agent)
+            self.signals.response_ready.emit(response)
+            
+            # Сохраняем в историю
+            save_to_memory("Агент", response)
+
+# Класс для транскрибации в фоновом режиме
+class TranscriptionThread(QThread):
+    def __init__(self, signals, transcriber, file_path=None, youtube_url=None):
+        super().__init__()
+        self.signals = signals
+        self.transcriber = transcriber
+        self.file_path = file_path
+        self.youtube_url = youtube_url
+        
+    def run(self):
+        try:
+            # Начинаем с 10% прогресса
+            self.signals.progress_update.emit(10)
+            
+            if self.file_path:
+                # Транскрибация файла
+                self.signals.progress_update.emit(30)
+                success, text = self.transcriber.process_audio_file(self.file_path)
+            elif self.youtube_url:
+                # Транскрибация YouTube
+                self.signals.progress_update.emit(30)
+                success, text = self.transcriber.transcribe_youtube(self.youtube_url)
+            else:
+                success, text = False, "Не указан источник для транскрибации"
+            
+            # Сигнализируем о завершении
+            self.signals.progress_update.emit(100)
+            self.signals.transcription_complete.emit(success, text)
+            
+        except Exception as e:
+            self.signals.progress_update.emit(100)
+            self.signals.transcription_complete.emit(False, f"Ошибка при транскрибации: {str(e)}")
+
+# Класс для распознавания голоса в отдельном потоке
 class VoiceRecognitionThread(QThread):
     def __init__(self, signals):
         super().__init__()
         self.signals = signals
-        self.running = False
-        self.paused = False  # Флаг для приостановки распознавания
-        self.queue = queue.Queue()
+        self.running = True
+        self.paused = False
+        self.pause_condition = threading.Condition()
         
     def run(self):
+        """Основной метод для запуска распознавания речи"""
+        if not check_vosk_model():
+            self.signals.voice_error.emit("Модель распознавания речи не найдена")
+            return
+            
         try:
-            from vosk import Model, KaldiRecognizer
-            import sounddevice as sd
-            
-            # Проверяем наличие модели
-            if not check_vosk_model():
-                self.signals.voice_error.emit("Модель распознавания речи не найдена")
-                return
-                
-            # Инициализация модели распознавания речи
             model = Model(VOSK_MODEL_PATH)
-            recognizer = KaldiRecognizer(model, 16000)
+            q = queue.Queue()
             
-            # Запуск аудио потока
-            with sd.RawInputStream(
-                samplerate=16000, 
-                blocksize=8000, 
-                dtype='int16',
-                channels=1,
-                callback=self.audio_callback
-            ):
-                self.running = True
+            def callback(indata, frames, time, status):
+                if status:
+                    print("Ошибка:", status, file=sys.stderr)
+                if self.running and not self.paused:
+                    q.put(bytes(indata))
+            
+            with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16',
+                                  channels=1, callback=callback):
+                rec = KaldiRecognizer(model, SAMPLE_RATE)
                 
                 while self.running:
-                    # Если распознавание приостановлено, ждем
-                    if self.paused:
-                        time.sleep(0.1)
-                        continue
-                        
+                    # Проверяем, не поставлен ли поток на паузу
+                    with self.pause_condition:
+                        if self.paused:
+                            self.pause_condition.wait()  # Ждем возобновления
+                            continue
+                    
                     try:
-                        data = self.queue.get(timeout=1)
-                        if recognizer.AcceptWaveform(data):
-                            result = json.loads(recognizer.Result())
+                        data = q.get(timeout=0.5)  # Таймаут, чтобы периодически проверять running
+                        if rec.AcceptWaveform(data):
+                            result = json.loads(rec.Result())
                             text = result.get("text", "").strip()
-                            if text:
+                            if text:  # Если распознан непустой текст
                                 self.signals.voice_recognized.emit(text)
                     except queue.Empty:
-                        continue
+                        pass  # Просто продолжаем, если данных нет
                         
         except Exception as e:
-            self.signals.voice_error.emit(str(e))
-            
-    def audio_callback(self, indata, frames, time, status):
-        if status:
-            print(f"Ошибка статуса: {status}")
-        if not self.paused:  # Добавляем данные только если не на паузе
-            self.queue.put(bytes(indata))
-        
-    def pause(self):
-        """Приостановить распознавание"""
-        self.paused = True
-        
-    def resume(self):
-        """Возобновить распознавание"""
-        self.paused = False
-        
+            self.signals.voice_error.emit(f"Ошибка при распознавании речи: {str(e)}")
+    
     def stop(self):
-        """Полностью остановить распознавание"""
+        """Остановка потока распознавания"""
         self.running = False
+        with self.pause_condition:
+            self.paused = False
+            self.pause_condition.notify_all()
         self.wait()
+    
+    def pause(self):
+        """Приостановка распознавания"""
+        with self.pause_condition:
+            self.paused = True
+    
+    def resume(self):
+        """Возобновление распознавания"""
+        with self.pause_condition:
+            self.paused = False
+            self.pause_condition.notify_all()
 
 class ModelConfig:
     """Класс для управления конфигурацией моделей"""
@@ -409,80 +470,102 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # Инициализация конфигурации моделей
-        self.model_config = ModelConfig()
+        # Инициализация объектов для работы с документами и транскрибацией
+        self.doc_processor = DocumentProcessor()
+        self.transcriber = Transcriber()
+        self.online_transcriber = OnlineTranscriber()
         
-        # Создаем объект сигналов
+        # Настройка сигналов
         self.signals = Signals()
         self.signals.response_ready.connect(self.handle_response)
         self.signals.error_occurred.connect(self.handle_error)
         self.signals.voice_recognized.connect(self.handle_voice_recognition)
         self.signals.voice_error.connect(self.handle_voice_error)
         self.signals.voice_response_ready.connect(self.handle_voice_response)
+        self.signals.document_processed.connect(self.handle_document_processed)
+        self.signals.transcription_complete.connect(self.handle_transcription_complete)
+        self.signals.progress_update.connect(self.update_progress_bar)
+        self.signals.online_transcription_result.connect(self.handle_online_transcription)
         
-        # Инициализация переменных для голосового режима
-        self.voice_recognition_thread = None
-        self.is_listening = False
-        self.is_responding = False  # Флаг, указывающий, что модель генерирует ответ
+        # Настройка предпочтений
+        self.model_config = ModelConfig()
         
-        # Базовая настройка окна
-        self.setWindowTitle("MemoAI Ассистент")
-        self.setMinimumSize(1000, 700)
+        # Настройка главного окна
+        self.setWindowTitle("MemoAI")
+        self.setMinimumSize(900, 600)
+        self.setWindowIcon(QIcon("assets/icon.ico"))
         
-        # Создаем центральный виджет
+        # Центральный виджет и компоновка
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         
-        # Основная компоновка
-        self.main_layout = QHBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(0)
+        # Создаем основную горизонтальную компоновку
+        self.main_layout = QHBoxLayout()
+        self.central_widget.setLayout(self.main_layout)
         
-        # Создаем боковую панель (шторку)
-        self.sidebar = QWidget()
-        self.sidebar.setFixedWidth(0)  # Изначально скрыта
-        self.sidebar.setMinimumWidth(0)
-        self.sidebar.setMaximumWidth(250)
-        self.sidebar_layout = QVBoxLayout(self.sidebar)
-        self.sidebar_layout.setContentsMargins(10, 10, 10, 10)
-        self.setup_sidebar()
+        # Создаем боковую панель
+        self.sidebar_frame = QFrame()
+        self.sidebar_frame.setFixedWidth(200)
+        self.sidebar_layout = QVBoxLayout(self.sidebar_frame)
+        self.sidebar_layout.setContentsMargins(10, 20, 10, 20)
+        self.sidebar_layout.setSpacing(10)
         
-        # Создаем основной контент
-        self.content = QWidget()
-        self.content_layout = QVBoxLayout(self.content)
+        # Создаем основную рабочую область
+        self.content_frame = QFrame()
+        self.content_layout = QVBoxLayout(self.content_frame)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Создаем верхнюю панель
-        self.header = QWidget()
-        self.header.setFixedHeight(60)
-        self.header_layout = QHBoxLayout(self.header)
-        self.header_layout.setContentsMargins(10, 5, 10, 5)
+        # Добавляем панели в главную компоновку
+        self.main_layout.addWidget(self.sidebar_frame)
+        self.main_layout.addWidget(self.content_frame)
+        
+        # Настраиваем боковую панель
+        self.setup_sidebar()
+        
+        # Настраиваем заголовок
+        self.header_frame = QFrame()
+        self.header_layout = QHBoxLayout(self.header_frame)
+        self.header_layout.setContentsMargins(20, 10, 20, 10)
+        self.content_layout.addWidget(self.header_frame)
         self.setup_header()
         
         # Создаем вкладки
         self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)  # Более компактный вид
-        
-        # Вкладка чата
-        self.chat_tab = QWidget()
-        self.setup_chat_tab()
-        self.tabs.addTab(self.chat_tab, "Текстовый чат")
-        
-        # Вкладка голосового чата
-        self.voice_tab = QWidget()
-        self.setup_voice_tab()
-        self.tabs.addTab(self.voice_tab, "Голосовой чат")
-        
-        # Добавляем элементы в основной контент
-        self.content_layout.addWidget(self.header)
         self.content_layout.addWidget(self.tabs)
         
-        # Добавляем шторку и основной контент в главную компоновку
-        self.main_layout.addWidget(self.sidebar)
-        self.main_layout.addWidget(self.content)
+        # Добавляем вкладку с чатом
+        self.chat_tab = QWidget()
+        self.chat_layout = QVBoxLayout(self.chat_tab)
+        self.tabs.addTab(self.chat_tab, "Текстовый чат")
+        self.setup_chat_tab()
+        
+        # Добавляем вкладку с голосом
+        self.voice_tab = QWidget()
+        self.voice_layout = QVBoxLayout(self.voice_tab)
+        self.tabs.addTab(self.voice_tab, "Голосовой режим")
+        self.setup_voice_tab()
+        
+        # Добавляем вкладку для работы с документами
+        self.docs_tab = QWidget()
+        self.docs_layout = QVBoxLayout(self.docs_tab)
+        self.tabs.addTab(self.docs_tab, "Документы")
+        self.setup_docs_tab()
+        
+        # Добавляем вкладку для транскрибации
+        self.transcribe_tab = QWidget()
+        self.transcribe_layout = QVBoxLayout(self.transcribe_tab)
+        self.tabs.addTab(self.transcribe_tab, "Транскрибация")
+        self.setup_transcribe_tab()
+        
+        # Добавляем вкладку для онлайн-транскрибации совещаний
+        self.setup_online_transcribe_tab()
         
         # Применяем тему
         self.apply_theme()
+        
+        # Инициализация голосового распознавания
+        self.voice_recognition_thread = None
+        self.recognition_active = False
     
     def setup_sidebar(self):
         """Настройка боковой панели (шторки)"""
@@ -550,13 +633,11 @@ class MainWindow(QMainWindow):
     
     def setup_chat_tab(self):
         """Настройка вкладки чата"""
-        layout = QVBoxLayout(self.chat_tab)
-        
         # История чата
         self.chat_history = QTextEdit()
         self.chat_history.setReadOnly(True)
         self.chat_history.setFont(QFont("Arial", 11))
-        layout.addWidget(self.chat_history)
+        self.chat_layout.addWidget(self.chat_history)
         
         # Поле ввода и кнопка отправки
         input_layout = QHBoxLayout()
@@ -566,27 +647,25 @@ class MainWindow(QMainWindow):
         self.chat_input.setFont(QFont("Arial", 11))
         self.chat_input.returnPressed.connect(self.send_message)
         
-        send_button = QPushButton("Отправить")
-        send_button.setFixedWidth(100)
-        send_button.clicked.connect(self.send_message)
+        self.send_button = QPushButton("Отправить")
+        self.send_button.setFixedWidth(100)
+        self.send_button.clicked.connect(self.send_message)
         
         input_layout.addWidget(self.chat_input)
-        input_layout.addWidget(send_button)
+        input_layout.addWidget(self.send_button)
         
-        layout.addLayout(input_layout)
+        self.chat_layout.addLayout(input_layout)
         
         # Добавляем приветственное сообщение
         self.append_message("Ассистент", "Привет! Я ваш AI-ассистент. Чем могу помочь?")
     
     def setup_voice_tab(self):
         """Настройка вкладки голосового чата"""
-        layout = QVBoxLayout(self.voice_tab)
-        
         # История голосового чата
         self.voice_history = QTextEdit()
         self.voice_history.setReadOnly(True)
         self.voice_history.setFont(QFont("Arial", 11))
-        layout.addWidget(self.voice_history)
+        self.voice_layout.addWidget(self.voice_history)
         
         # Панель управления голосовым режимом
         control_layout = QHBoxLayout()
@@ -603,21 +682,432 @@ class MainWindow(QMainWindow):
         control_layout.addStretch()
         control_layout.addWidget(self.voice_toggle_button)
         
-        layout.addLayout(control_layout)
+        self.voice_layout.addLayout(control_layout)
         
         # Добавляем приветственное сообщение
         self.append_voice_message("Ассистент", "Привет! Нажмите кнопку микрофона, чтобы начать голосовое общение.")
     
+    def setup_docs_tab(self):
+        """Настройка вкладки для работы с документами"""
+        # Создаем разделитель для документов и чата
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.docs_layout.addWidget(splitter)
+        
+        # Левая панель для документов
+        docs_panel = QWidget()
+        docs_panel_layout = QVBoxLayout(docs_panel)
+        
+        # Заголовок
+        docs_header = QLabel("Загруженные документы")
+        docs_header.setStyleSheet("font-size: 16px; font-weight: bold;")
+        docs_panel_layout.addWidget(docs_header)
+        
+        # Кнопки управления документами
+        docs_controls = QHBoxLayout()
+        
+        self.load_doc_btn = QPushButton("Загрузить документ")
+        self.load_doc_btn.clicked.connect(self.load_document)
+        docs_controls.addWidget(self.load_doc_btn)
+        
+        self.clear_docs_btn = QPushButton("Очистить")
+        self.clear_docs_btn.clicked.connect(self.clear_documents)
+        docs_controls.addWidget(self.clear_docs_btn)
+        
+        docs_panel_layout.addLayout(docs_controls)
+        
+        # Список документов
+        self.docs_list = QListWidget()
+        docs_panel_layout.addWidget(self.docs_list)
+        
+        # Правая панель для чата с документами
+        chat_panel = QWidget()
+        chat_panel_layout = QVBoxLayout(chat_panel)
+        
+        # Заголовок
+        chat_docs_header = QLabel("Запросы к документам")
+        chat_docs_header.setStyleSheet("font-size: 16px; font-weight: bold;")
+        chat_panel_layout.addWidget(chat_docs_header)
+        
+        # Область чата
+        self.docs_chat_area = QTextEdit()
+        self.docs_chat_area.setReadOnly(True)
+        chat_panel_layout.addWidget(self.docs_chat_area)
+        
+        # Поле ввода и кнопка отправки
+        input_layout = QHBoxLayout()
+        
+        self.docs_input = QLineEdit()
+        self.docs_input.setPlaceholderText("Введите запрос к документам...")
+        self.docs_input.returnPressed.connect(self.send_docs_query)
+        input_layout.addWidget(self.docs_input)
+        
+        self.docs_send_btn = QPushButton("Отправить")
+        self.docs_send_btn.clicked.connect(self.send_docs_query)
+        input_layout.addWidget(self.docs_send_btn)
+        
+        chat_panel_layout.addLayout(input_layout)
+        
+        # Добавляем панели в разделитель
+        splitter.addWidget(docs_panel)
+        splitter.addWidget(chat_panel)
+        splitter.setSizes([300, 600])  # Начальные размеры панелей
+    
+    def setup_transcribe_tab(self):
+        """Настройка вкладки для транскрибации"""
+        # Верхняя панель с настройками
+        settings_group = QGroupBox("Настройки транскрибации")
+        settings_layout = QFormLayout(settings_group)
+        
+        # Выбор размера модели
+        self.model_size_combo = QComboBox()
+        self.model_size_combo.addItems(["tiny", "base", "small", "medium", "large"])
+        self.model_size_combo.setCurrentText("base")
+        self.model_size_combo.currentTextChanged.connect(self.change_model_size)
+        settings_layout.addRow("Размер модели:", self.model_size_combo)
+        
+        # Выбор языка
+        self.language_combo = QComboBox()
+        self.language_combo.addItems(["ru", "en", "auto"])
+        self.language_combo.setCurrentText("ru")
+        self.language_combo.currentTextChanged.connect(self.change_transcription_language)
+        settings_layout.addRow("Язык:", self.language_combo)
+        
+        self.transcribe_layout.addWidget(settings_group)
+        
+        # Панель источников
+        source_group = QGroupBox("Источник для транскрибации")
+        source_layout = QVBoxLayout(source_group)
+        
+        # Кнопки выбора источника
+        self.source_radio_group = QButtonGroup(self)
+        
+        self.file_radio = QRadioButton("Файл (аудио/видео)")
+        self.file_radio.setChecked(True)
+        self.source_radio_group.addButton(self.file_radio)
+        source_layout.addWidget(self.file_radio)
+        
+        self.youtube_radio = QRadioButton("YouTube")
+        self.source_radio_group.addButton(self.youtube_radio)
+        source_layout.addWidget(self.youtube_radio)
+        
+        # Поле ввода для URL и кнопка выбора файла
+        input_layout = QHBoxLayout()
+        
+        self.transcribe_input = QLineEdit()
+        self.transcribe_input.setPlaceholderText("Введите URL YouTube или выберите файл...")
+        input_layout.addWidget(self.transcribe_input)
+        
+        self.browse_file_btn = QPushButton("Выбрать файл")
+        self.browse_file_btn.clicked.connect(self.browse_media_file)
+        input_layout.addWidget(self.browse_file_btn)
+        
+        source_layout.addLayout(input_layout)
+        
+        # Кнопка начала транскрибации и индикатор прогресса
+        transcribe_controls = QHBoxLayout()
+        
+        self.start_transcribe_btn = QPushButton("Начать транскрибацию")
+        self.start_transcribe_btn.clicked.connect(self.start_transcription)
+        transcribe_controls.addWidget(self.start_transcribe_btn)
+        
+        self.transcribe_progress = QProgressBar()
+        self.transcribe_progress.setRange(0, 100)
+        self.transcribe_progress.setValue(0)
+        transcribe_controls.addWidget(self.transcribe_progress)
+        
+        source_layout.addLayout(transcribe_controls)
+        
+        self.transcribe_layout.addWidget(source_group)
+        
+        # Область результатов
+        result_group = QGroupBox("Результаты транскрибации")
+        result_layout = QVBoxLayout(result_group)
+        
+        self.transcribe_result = QTextEdit()
+        self.transcribe_result.setReadOnly(True)
+        result_layout.addWidget(self.transcribe_result)
+        
+        # Кнопки действий с результатами
+        action_layout = QHBoxLayout()
+        
+        self.copy_result_btn = QPushButton("Копировать")
+        self.copy_result_btn.clicked.connect(self.copy_transcription)
+        action_layout.addWidget(self.copy_result_btn)
+        
+        self.save_result_btn = QPushButton("Сохранить в файл")
+        self.save_result_btn.clicked.connect(self.save_transcription)
+        action_layout.addWidget(self.save_result_btn)
+        
+        result_layout.addLayout(action_layout)
+        
+        self.transcribe_layout.addWidget(result_group)
+    
+    def setup_online_transcribe_tab(self):
+        """Настройка вкладки для онлайн-транскрибации совещаний"""
+        # Создаем вкладку
+        self.online_transcribe_tab = QWidget()
+        self.online_transcribe_layout = QVBoxLayout(self.online_transcribe_tab)
+        
+        # Добавляем вкладку в основной виджет с вкладками
+        self.tabs.addTab(self.online_transcribe_tab, QIcon("assets/online.png"), "Совещания")
+        
+        # Верхняя панель с настройками
+        settings_group = QGroupBox("Настройки записи совещания")
+        settings_layout = QVBoxLayout(settings_group)
+        
+        # Настройки источников аудио
+        sources_form = QFormLayout()
+        
+        # Чекбокс для микрофона
+        self.mic_checkbox = QCheckBox("Записывать микрофон (ваш голос)")
+        self.mic_checkbox.setChecked(True)
+        sources_form.addRow("Записывать микрофон:", self.mic_checkbox)
+        
+        # Чекбокс для системного звука
+        self.system_audio_checkbox = QCheckBox("Записывать аудио системы (голоса собеседников)")
+        self.system_audio_checkbox.setChecked(True)
+        sources_form.addRow("Записывать аудио системы:", self.system_audio_checkbox)
+        
+        # Выбор устройства для системного звука
+        audio_devices_layout = QHBoxLayout()
+        self.system_device_combo = QComboBox()
+        self.refresh_audio_devices_btn = QPushButton("Обновить список")
+        self.refresh_audio_devices_btn.clicked.connect(self.refresh_audio_devices)
+        
+        audio_devices_layout.addWidget(QLabel("Устройство для захвата аудио системы:"))
+        audio_devices_layout.addWidget(self.system_device_combo)
+        audio_devices_layout.addWidget(self.refresh_audio_devices_btn)
+        
+        sources_form.addRow("", audio_devices_layout)
+        
+        # Информация о настройке аудио
+        info_label = QLabel("Для записи аудио системы (звук из динамиков) необходимо:\n"
+                          "1. В Windows: Включите 'Стерео микшер' в настройках звука или\n"
+                          "2. Установите виртуальный аудиокабель (например, VB-Cable)\n"
+                          "3. Выберите соответствующее устройство в списке выше")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666; font-style: italic;")
+        sources_form.addRow(info_label)
+        
+        # Кнопки управления записью
+        controls_layout = QHBoxLayout()
+        
+        self.start_meeting_btn = QPushButton("Начать запись совещания")
+        self.start_meeting_btn.clicked.connect(self.start_online_transcription)
+        self.start_meeting_btn.setMinimumHeight(40)
+        
+        self.stop_meeting_btn = QPushButton("Остановить запись")
+        self.stop_meeting_btn.clicked.connect(self.stop_online_transcription)
+        self.stop_meeting_btn.setEnabled(False)
+        self.stop_meeting_btn.setMinimumHeight(40)
+        
+        controls_layout.addWidget(self.start_meeting_btn)
+        controls_layout.addWidget(self.stop_meeting_btn)
+        
+        sources_form.addRow("", controls_layout)
+        
+        # Добавляем настройки на вкладку
+        settings_layout.addLayout(sources_form)
+        self.online_transcribe_layout.addWidget(settings_group)
+        
+        # Область для отображения транскрипции в реальном времени
+        transcript_group = QGroupBox("Стенограмма совещания")
+        transcript_layout = QVBoxLayout(transcript_group)
+        
+        self.online_transcript_area = QTextEdit()
+        self.online_transcript_area.setReadOnly(True)
+        transcript_layout.addWidget(self.online_transcript_area)
+        
+        # Кнопки для сохранения транскрипта
+        save_layout = QHBoxLayout()
+        
+        self.copy_transcript_btn = QPushButton("Копировать стенограмму")
+        self.copy_transcript_btn.clicked.connect(self.copy_online_transcript)
+        
+        self.save_transcript_btn = QPushButton("Сохранить в файл")
+        self.save_transcript_btn.clicked.connect(self.save_online_transcript)
+        
+        save_layout.addWidget(self.copy_transcript_btn)
+        save_layout.addWidget(self.save_transcript_btn)
+        
+        transcript_layout.addLayout(save_layout)
+        
+        # Добавляем область транскрипции на вкладку
+        self.online_transcribe_layout.addWidget(transcript_group)
+        
+        # Заполняем список устройств
+        self.refresh_audio_devices()
+    
+    def refresh_audio_devices(self):
+        """Обновление списка аудиоустройств"""
+        try:
+            self.system_device_combo.clear()
+            
+            import sounddevice as sd
+            devices = sd.query_devices()
+            
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:  # Только устройства с входными каналами
+                    device_name = device['name']
+                    is_system = any(keyword in device_name for keyword in ['CABLE', 'Mix', 'Loopback', 'VAC', 'VB-Audio'])
+                    
+                    # Добавляем индикатор для устройств, которые могут захватывать системный звук
+                    if is_system:
+                        self.system_device_combo.addItem(f"✓ {device_name} (Системный звук)", i)
+                    else:
+                        self.system_device_combo.addItem(device_name, i)
+            
+            # Выбираем первое "системное" устройство, если есть
+            for i in range(self.system_device_combo.count()):
+                if "✓" in self.system_device_combo.itemText(i):
+                    self.system_device_combo.setCurrentIndex(i)
+                    break
+                    
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось получить список аудиоустройств: {str(e)}")
+    
+    def start_online_transcription(self):
+        """Запуск онлайн-транскрибации совещания"""
+        # Проверяем выбранные источники
+        capture_mic = self.mic_checkbox.isChecked()
+        capture_system = self.system_audio_checkbox.isChecked()
+        
+        if not capture_mic and not capture_system:
+            QMessageBox.warning(self, "Внимание", "Выберите хотя бы один источник аудио для записи")
+            return
+            
+        # Получаем выбранное устройство для системного звука
+        system_device = None
+        if capture_system and self.system_device_combo.currentData() is not None:
+            system_device = self.system_device_combo.currentData()
+        
+        try:
+            # Очищаем текстовую область
+            self.online_transcript_area.clear()
+            
+            # Запускаем транскрибацию
+            success, message = self.online_transcriber.start_transcription(
+                results_callback=self.handle_real_time_transcript, 
+                capture_mic=capture_mic, 
+                capture_system=capture_system
+            )
+            
+            if success:
+                # Меняем состояние кнопок
+                self.start_meeting_btn.setEnabled(False)
+                self.stop_meeting_btn.setEnabled(True)
+                self.mic_checkbox.setEnabled(False)
+                self.system_audio_checkbox.setEnabled(False)
+                self.system_device_combo.setEnabled(False)
+                self.refresh_audio_devices_btn.setEnabled(False)
+                
+                # Добавляем сообщение о начале записи
+                self.append_online_transcript({
+                    "time": QDateTime.currentDateTime().toString("HH:mm:ss"),
+                    "speaker": "Система",
+                    "text": "Запись совещания началась. Говорите в микрофон."
+                })
+            else:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось запустить транскрибацию: {message}")
+                
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Ошибка при запуске транскрибации: {str(e)}")
+    
+    def handle_real_time_transcript(self, entry):
+        """Обработка результатов онлайн-транскрибации"""
+        # Отправляем данные через сигнал для безопасного обновления UI
+        self.signals.online_transcription_result.emit(entry)
+    
+    def handle_online_transcription(self, entry):
+        """Обработка результатов онлайн-транскрибации в UI потоке"""
+        self.append_online_transcript(entry)
+    
+    def append_online_transcript(self, entry):
+        """Добавление записи в область транскрипции"""
+        time_str = entry["time"]
+        speaker = entry["speaker"]
+        text = entry["text"]
+        
+        # Определяем цвет для разных говорящих
+        if speaker == "Вы":
+            color = "#0066cc"
+        elif speaker == "Собеседник":
+            color = "#cc6600"
+        else:  # Система
+            color = "#666666"
+        
+        # Добавляем запись в текстовую область
+        cursor = self.online_transcript_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Форматируем текст
+        cursor.insertHtml(f'<p><span style="color: {color};"><b>[{time_str}] {speaker}:</b></span> {text}</p>')
+        
+        # Прокручиваем вниз
+        self.online_transcript_area.setTextCursor(cursor)
+        self.online_transcript_area.ensureCursorVisible()
+    
+    def stop_online_transcription(self):
+        """Остановка онлайн-транскрибации"""
+        try:
+            # Останавливаем транскрибацию
+            transcript = self.online_transcriber.stop_transcription()
+            
+            # Меняем состояние кнопок
+            self.start_meeting_btn.setEnabled(True)
+            self.stop_meeting_btn.setEnabled(False)
+            self.mic_checkbox.setEnabled(True)
+            self.system_audio_checkbox.setEnabled(True)
+            self.system_device_combo.setEnabled(True)
+            self.refresh_audio_devices_btn.setEnabled(True)
+            
+            # Добавляем сообщение о завершении записи
+            self.append_online_transcript({
+                "time": QDateTime.currentDateTime().toString("HH:mm:ss"),
+                "speaker": "Система",
+                "text": f"Запись совещания завершена. Всего записано {len(transcript)} фрагментов."
+            })
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Ошибка при остановке транскрибации: {str(e)}")
+    
+    def copy_online_transcript(self):
+        """Копирование стенограммы в буфер обмена"""
+        text = self.online_transcript_area.toPlainText()
+        if text:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+            QMessageBox.information(self, "Скопировано", "Стенограмма скопирована в буфер обмена")
+    
+    def save_online_transcript(self):
+        """Сохранение стенограммы в файл"""
+        # Запрашиваем путь для сохранения
+        file_dialog = QFileDialog()
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        file_dialog.setNameFilter("Текстовые файлы (*.txt)")
+        file_dialog.setDefaultSuffix("txt")
+        
+        if file_dialog.exec():
+            filenames = file_dialog.selectedFiles()
+            if filenames:
+                file_path = filenames[0]
+                success, message = self.online_transcriber.save_transcript(file_path)
+                
+                if success:
+                    QMessageBox.information(self, "Сохранено", f"Стенограмма сохранена в файл: {file_path}")
+                else:
+                    QMessageBox.warning(self, "Ошибка", f"Ошибка при сохранении стенограммы: {message}")
+    
     def toggle_sidebar(self):
         """Открытие/закрытие боковой панели"""
         # Текущая ширина
-        current_width = self.sidebar.width()
+        current_width = self.sidebar_frame.width()
         
         # Целевая ширина
-        target_width = 250 if current_width == 0 else 0
+        target_width = 200 if current_width == 0 else 0
         
         # Создаем анимацию
-        self.animation = QPropertyAnimation(self.sidebar, b"minimumWidth")
+        self.animation = QPropertyAnimation(self.sidebar_frame, b"minimumWidth")
         self.animation.setDuration(200)
         self.animation.setStartValue(current_width)
         self.animation.setEndValue(target_width)
@@ -625,7 +1115,7 @@ class MainWindow(QMainWindow):
         self.animation.start()
         
         # Дублируем анимацию для максимальной ширины
-        self.animation2 = QPropertyAnimation(self.sidebar, b"maximumWidth")
+        self.animation2 = QPropertyAnimation(self.sidebar_frame, b"maximumWidth")
         self.animation2.setDuration(200)
         self.animation2.setStartValue(current_width)
         self.animation2.setEndValue(target_width)
@@ -635,7 +1125,7 @@ class MainWindow(QMainWindow):
     def show_models_dialog(self):
         """Показывает диалог управления моделями"""
         # Закрываем боковую панель
-        if self.sidebar.width() > 0:
+        if self.sidebar_frame.width() > 0:
             self.toggle_sidebar()
         
         # Создаем диалог
@@ -834,7 +1324,7 @@ class MainWindow(QMainWindow):
     
     def toggle_voice_recognition(self):
         """Включение/выключение распознавания речи"""
-        if self.is_listening:
+        if self.recognition_active:
             self.stop_voice_recognition()
         else:
             self.start_voice_recognition()
@@ -846,7 +1336,7 @@ class MainWindow(QMainWindow):
             return
             
         try:
-            self.is_listening = True
+            self.recognition_active = True
             self.voice_toggle_button.setText("⏹ Остановить прослушивание")
             self.voice_status.setText("Слушаю... Говорите в микрофон")
             
@@ -862,7 +1352,7 @@ class MainWindow(QMainWindow):
     
     def stop_voice_recognition(self):
         """Остановка распознавания речи"""
-        self.is_listening = False
+        self.recognition_active = False
         self.voice_toggle_button.setText("🎤 Начать прослушивание")
         self.voice_status.setText("Ожидание...")
         
@@ -883,7 +1373,7 @@ class MainWindow(QMainWindow):
         
         # Меняем статус и останавливаем распознавание на время ответа
         self.voice_status.setText("Генерирую ответ...")
-        self.is_responding = True
+        self.recognition_active = True
         
         # Приостанавливаем распознавание речи на время ответа
         if self.voice_recognition_thread:
@@ -908,10 +1398,10 @@ class MainWindow(QMainWindow):
         speak_text(text, speaker)
         
         # Возобновляем прослушивание
-        self.is_responding = False
+        self.recognition_active = False
         
         # Возвращаем статус в исходное состояние
-        if self.is_listening:
+        if self.recognition_active:
             self.voice_status.setText("Слушаю... Говорите в микрофон")
             # Возобновляем распознавание речи
             if self.voice_recognition_thread:
@@ -964,6 +1454,7 @@ class MainWindow(QMainWindow):
         
         # Блокируем интерфейс
         self.chat_input.setEnabled(False)
+        self.send_button.setEnabled(False)
         
         # Показываем индикатор
         self.chat_history.append('<span style="color: #888888;">Ассистент печатает...</span>')
@@ -973,134 +1464,216 @@ class MainWindow(QMainWindow):
         self.agent_thread.start()
     
     def handle_response(self, response):
-        """Обработчик ответа от модели"""
-        # Удаляем индикатор "печатает..."
-        html_content = self.chat_history.toHtml()
-        html_content = html_content.replace(
-            '<span style="color: #888888;">Ассистент печатает...</span>', 
-            ''
-        )
-        self.chat_history.setHtml(html_content)
+        """Обработка ответа от модели"""
+        # Восстанавливаем кнопку
+        self.send_button.setEnabled(True)
         
-        # Добавляем ответ безопасным способом
-        color = "#009933"
-        self.chat_history.append(f'<span style="font-weight: bold; color: {color};">Ассистент:</span> {response}')
-        self.chat_history.append('<br>')  # Пустая строка после сообщения
+        # Добавляем ответ в историю чата
+        self.append_message("Агент", response)
         
-        # Восстанавливаем интерфейс
-        self.chat_input.setEnabled(True)
-        self.chat_input.setFocus()
+        # Если это ответ на запрос из вкладки документов
+        if self.tabs.currentIndex() == 2:  # Вкладка "Документы"
+            self.docs_send_btn.setEnabled(True)
+            self.append_docs_message("Агент", response)
     
     def handle_error(self, error):
         """Обработчик ошибки"""
-        # Удаляем индикатор "печатает..."
-        html_content = self.chat_history.toHtml()
-        html_content = html_content.replace(
-            '<span style="color: #888888;">Ассистент печатает...</span>', 
-            ''
-        )
-        self.chat_history.setHtml(html_content)
+        # Восстанавливаем кнопку
+        self.send_button.setEnabled(True)
         
-        # Добавляем сообщение об ошибке безопасным способом
-        self.chat_history.append(f'<span style="color: #cc0000;"><b>Ошибка:</b> {error}</span>')
-        self.chat_history.append('<br>')  # Пустая строка после сообщения
+        # Добавляем сообщение об ошибке в историю чата
+        self.append_message("Ошибка", error)
         
         # Восстанавливаем интерфейс
         self.chat_input.setEnabled(True)
         self.chat_input.setFocus()
     
-    def get_response(self, message):
-        """Этот метод больше не используется, оставлен для сохранения истории"""
-        pass
+    def load_document(self):
+        """Загрузка документа"""
+        file_dialog = QFileDialog()
+        file_dialog.setNameFilter("Документы (*.pdf *.docx *.xlsx *.xls)")
+        
+        if file_dialog.exec():
+            filenames = file_dialog.selectedFiles()
+            if filenames:
+                # Запускаем обработку в отдельном потоке
+                self.doc_thread = DocumentThread(self.signals, self.doc_processor, file_path=filenames[0])
+                self.doc_thread.start()
+                
+                # Деактивируем кнопку на время обработки
+                self.load_doc_btn.setEnabled(False)
+                self.load_doc_btn.setText("Загрузка...")
     
-    def show_llm_settings(self):
-        """Показать диалог настроек LLM"""
-        # Закрываем боковую панель
-        if self.sidebar.width() > 0:
-            self.toggle_sidebar()
-        
-        # Создаем и показываем диалог настроек
-        dialog = ModelSettingsDialog(self)
-        
-        if dialog.exec():
-            # Если пользователь нажал "Сохранить", применяем новые настройки
-            new_settings = dialog.get_settings()
-            
-            # Показываем диалог с информацией о перезагрузке модели
-            QMessageBox.information(
-                self,
-                "Перезагрузка модели",
-                "Настройки сохранены. Модель будет перезагружена с новыми параметрами."
-            )
-            
-            # Применяем новые настройки
-            try:
-                update_model_settings(new_settings)
-                QMessageBox.information(
-                    self,
-                    "Успех",
-                    "Модель успешно перезагружена с новыми настройками."
-                )
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "Ошибка",
-                    f"Не удалось перезагрузить модель: {str(e)}"
-                )
+    def clear_documents(self):
+        """Очистка загруженных документов"""
+        result = self.doc_processor.clear_documents()
+        self.docs_list.clear()
+        self.append_docs_message("Система", result)
     
-    def show_interface_settings(self):
-        """Показать диалог настроек интерфейса"""
-        # Закрываем боковую панель
-        if self.sidebar.width() > 0:
-            self.toggle_sidebar()
+    def handle_document_processed(self, success, message):
+        """Обработка результата обработки документа"""
+        # Восстанавливаем кнопку
+        self.load_doc_btn.setEnabled(True)
+        self.load_doc_btn.setText("Загрузить документ")
         
-        # Создаем диалог
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Настройки интерфейса")
-        dialog.setMinimumWidth(400)
+        if success:
+            # Обновляем список документов
+            self.docs_list.clear()
+            for doc_name in self.doc_processor.get_document_list():
+                self.docs_list.addItem(doc_name)
+            
+            # Добавляем сообщение об успехе
+            self.append_docs_message("Система", message)
+        else:
+            # Отображаем ошибку
+            QMessageBox.warning(self, "Ошибка", message)
+    
+    def send_docs_query(self):
+        """Отправка запроса к документам"""
+        query = self.docs_input.text().strip()
+        if not query:
+            return
         
-        layout = QVBoxLayout(dialog)
+        # Очищаем поле ввода
+        self.docs_input.clear()
         
-        # Настройка темы
-        theme_layout = QFormLayout()
-        theme_combo = QComboBox()
-        theme_combo.addItems(["Светлая тема", "Темная тема"])
-        current_theme = self.model_config.config.get("theme", "light")
-        theme_combo.setCurrentIndex(0 if current_theme == "light" else 1)
+        # Добавляем запрос в историю чата
+        self.append_docs_message("Вы", query)
         
-        theme_layout.addRow("Тема оформления:", theme_combo)
+        # Проверяем наличие загруженных документов
+        if not self.doc_processor.get_document_list():
+            self.append_docs_message("Система", "Нет загруженных документов. Пожалуйста, загрузите документы перед выполнением запроса.")
+            return
         
-        # Кнопки
-        buttons_layout = QHBoxLayout()
+        # Запускаем обработку в отдельном потоке
+        self.doc_thread = DocumentThread(self.signals, self.doc_processor, query=query)
+        self.doc_thread.start()
         
-        cancel_button = QPushButton("Отмена")
-        cancel_button.clicked.connect(dialog.reject)
+        # Деактивируем кнопку на время обработки
+        self.docs_send_btn.setEnabled(False)
+    
+    def append_docs_message(self, sender, message):
+        """Добавление сообщения в историю чата с документами"""
+        timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
         
-        save_button = QPushButton("Сохранить")
-        save_button.clicked.connect(dialog.accept)
+        cursor = self.docs_chat_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         
-        buttons_layout.addStretch()
-        buttons_layout.addWidget(cancel_button)
-        buttons_layout.addWidget(save_button)
+        # Форматирование имени отправителя
+        cursor.insertHtml(f'<p><span style="font-weight: bold; color: {"#0066cc" if sender == "Вы" else "#cc0000"};">[{timestamp}] {sender}:</span><br/>')
         
-        # Добавляем в основной макет
-        layout.addLayout(theme_layout)
-        layout.addStretch()
-        layout.addLayout(buttons_layout)
+        # Добавляем сообщение с переносами строк
+        message_formatted = message.replace('\n', '<br/>')
+        cursor.insertHtml(f'{message_formatted}</p>')
         
-        # Сохраняем настройки при принятии
-        if dialog.exec():
-            new_theme = "light" if theme_combo.currentIndex() == 0 else "dark"
-            if new_theme != self.model_config.config.get("theme", "light"):
-                self.model_config.config["theme"] = new_theme
-                self.model_config.save_config()
-                self.apply_theme()
-                QMessageBox.information(
-                    self,
-                    "Тема изменена",
-                    "Тема оформления успешно изменена."
-                )
-
+        # Прокручиваем вниз
+        self.docs_chat_area.setTextCursor(cursor)
+        self.docs_chat_area.ensureCursorVisible()
+    
+    def browse_media_file(self):
+        """Выбор медиа-файла для транскрибации"""
+        file_dialog = QFileDialog()
+        file_dialog.setNameFilter("Медиа файлы (*.mp3 *.wav *.mp4 *.avi *.mov *.m4a *.flac *.webm *.mkv)")
+        
+        if file_dialog.exec():
+            filenames = file_dialog.selectedFiles()
+            if filenames:
+                self.transcribe_input.setText(filenames[0])
+                # Переключаем радиокнопку на файловый режим
+                self.file_radio.setChecked(True)
+    
+    def start_transcription(self):
+        """Начало процесса транскрибации"""
+        # Получаем источник
+        source = self.transcribe_input.text().strip()
+        if not source:
+            QMessageBox.warning(self, "Ошибка", "Укажите источник для транскрибации")
+            return
+        
+        # Определяем тип источника
+        is_file = self.file_radio.isChecked()
+        is_youtube = self.youtube_radio.isChecked()
+        
+        # Проверка валидности источника
+        if is_file and not os.path.exists(source):
+            QMessageBox.warning(self, "Ошибка", "Указанный файл не существует")
+            return
+        
+        if is_youtube and not (source.startswith("http://") or source.startswith("https://")):
+            QMessageBox.warning(self, "Ошибка", "Неверный формат URL")
+            return
+        
+        # Запускаем транскрибацию в отдельном потоке
+        self.transcribe_thread = TranscriptionThread(
+            self.signals, 
+            self.transcriber,
+            file_path=source if is_file else None,
+            youtube_url=source if is_youtube else None
+        )
+        self.transcribe_thread.start()
+        
+        # Деактивируем кнопку на время транскрибации
+        self.start_transcribe_btn.setEnabled(False)
+        self.start_transcribe_btn.setText("Транскрибация...")
+        
+        # Сбрасываем прогресс
+        self.transcribe_progress.setValue(0)
+    
+    def update_progress_bar(self, value):
+        """Обновление индикатора прогресса"""
+        self.transcribe_progress.setValue(value)
+    
+    def handle_transcription_complete(self, success, text):
+        """Обработка результата транскрибации"""
+        # Восстанавливаем кнопку
+        self.start_transcribe_btn.setEnabled(True)
+        self.start_transcribe_btn.setText("Начать транскрибацию")
+        
+        if success:
+            # Отображаем результат
+            self.transcribe_result.setPlainText(text)
+        else:
+            # Отображаем ошибку
+            QMessageBox.warning(self, "Ошибка", text)
+            self.transcribe_result.setPlainText(f"Ошибка транскрибации: {text}")
+    
+    def copy_transcription(self):
+        """Копирование результата транскрибации в буфер обмена"""
+        text = self.transcribe_result.toPlainText()
+        if text:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+            QMessageBox.information(self, "Скопировано", "Результат транскрибации скопирован в буфер обмена")
+    
+    def save_transcription(self):
+        """Сохранение результата транскрибации в файл"""
+        text = self.transcribe_result.toPlainText()
+        if not text:
+            return
+        
+        file_dialog = QFileDialog()
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        file_dialog.setNameFilter("Текстовые файлы (*.txt)")
+        file_dialog.setDefaultSuffix("txt")
+        
+        if file_dialog.exec():
+            filenames = file_dialog.selectedFiles()
+            if filenames:
+                try:
+                    with open(filenames[0], 'w', encoding='utf-8') as f:
+                        f.write(text)
+                    QMessageBox.information(self, "Сохранено", f"Результат транскрибации сохранен в файл {filenames[0]}")
+                except Exception as e:
+                    QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {str(e)}")
+    
+    def change_model_size(self, size):
+        """Изменение размера модели для транскрибации"""
+        self.transcriber.set_model_size(size)
+    
+    def change_transcription_language(self, language):
+        """Изменение языка для транскрибации"""
+        self.transcriber.set_language(language)
+    
     def apply_theme(self):
         """Применение выбранной темы к приложению"""
         theme = self.model_config.config.get("theme", "light")
@@ -1328,9 +1901,93 @@ class MainWindow(QMainWindow):
             }
         """)
     
-    def apply_stylesheet(self):
-        """Этот метод больше не используется, вместо него применяется apply_theme"""
-        self.apply_theme()
+    def show_llm_settings(self):
+        """Показать диалог настроек LLM"""
+        # Закрываем боковую панель
+        if self.sidebar_frame.width() > 0:
+            self.toggle_sidebar()
+        
+        # Создаем и показываем диалог настроек
+        dialog = ModelSettingsDialog(self)
+        
+        if dialog.exec():
+            # Если пользователь нажал "Сохранить", применяем новые настройки
+            new_settings = dialog.get_settings()
+            
+            # Показываем диалог с информацией о перезагрузке модели
+            QMessageBox.information(
+                self,
+                "Перезагрузка модели",
+                "Настройки сохранены. Модель будет перезагружена с новыми параметрами."
+            )
+            
+            # Применяем новые настройки
+            try:
+                update_model_settings(new_settings)
+                QMessageBox.information(
+                    self,
+                    "Успех",
+                    "Модель успешно перезагружена с новыми настройками."
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Ошибка",
+                    f"Не удалось перезагрузить модель: {str(e)}"
+                )
+    
+    def show_interface_settings(self):
+        """Показать диалог настроек интерфейса"""
+        # Закрываем боковую панель
+        if self.sidebar_frame.width() > 0:
+            self.toggle_sidebar()
+        
+        # Создаем диалог
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Настройки интерфейса")
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Настройка темы
+        theme_layout = QFormLayout()
+        theme_combo = QComboBox()
+        theme_combo.addItems(["Светлая тема", "Темная тема"])
+        current_theme = self.model_config.config.get("theme", "light")
+        theme_combo.setCurrentIndex(0 if current_theme == "light" else 1)
+        
+        theme_layout.addRow("Тема оформления:", theme_combo)
+        
+        # Кнопки
+        buttons_layout = QHBoxLayout()
+        
+        cancel_button = QPushButton("Отмена")
+        cancel_button.clicked.connect(dialog.reject)
+        
+        save_button = QPushButton("Сохранить")
+        save_button.clicked.connect(dialog.accept)
+        
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(cancel_button)
+        buttons_layout.addWidget(save_button)
+        
+        # Добавляем в основной макет
+        layout.addLayout(theme_layout)
+        layout.addStretch()
+        layout.addLayout(buttons_layout)
+        
+        # Сохраняем настройки при принятии
+        if dialog.exec():
+            new_theme = "light" if theme_combo.currentIndex() == 0 else "dark"
+            if new_theme != self.model_config.config.get("theme", "light"):
+                self.model_config.config["theme"] = new_theme
+                self.model_config.save_config()
+                self.apply_theme()
+                QMessageBox.information(
+                    self,
+                    "Тема изменена",
+                    "Тема оформления успешно изменена."
+                )
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
