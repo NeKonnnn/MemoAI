@@ -8,5 +8,7 @@
   "verbose": true,
   "temperature": 0.7,
   "top_p": 0.95,
-  "repeat_penalty": 1.05
+  "repeat_penalty": 1.05,
+  "use_gpu": true,
+  "streaming": true
 }

@@ -19,7 +19,9 @@ class ModelSettings:
             "verbose": True,           # Подробный вывод
             "temperature": 0.7,        # Температура генерации
             "top_p": 0.95,             # Top-p sampling
-            "repeat_penalty": 1.05     # Штраф за повторения
+            "repeat_penalty": 1.05,    # Штраф за повторения
+            "use_gpu": False,          # Использовать GPU
+            "streaming": False         # Использовать потоковую генерацию
         }
         self.settings = self.default_settings.copy()
         self.load_settings()
@@ -108,7 +110,9 @@ def initialize_model():
             model_to_use = find_available_model()
         
         if model_to_use and os.path.exists(model_to_use):
-            print(f"Загружаю модель из: {model_to_use}")
+            use_gpu = model_settings.get("use_gpu", False)
+            device_type = "GPU" if use_gpu else "CPU"
+            print(f"Загружаю модель из: {model_to_use} (устройство: {device_type})")
             try:
                 # Параметры для модели с текущими настройками
                 llm = Llama(
@@ -119,9 +123,10 @@ def initialize_model():
                     use_mlock=model_settings.get("use_mlock"),
                     verbose=model_settings.get("verbose"),
                     seed=42,                          # Фиксированное зерно для стабильности
-                    n_threads=model_settings.get("n_threads")
+                    n_threads=model_settings.get("n_threads"),
+                    use_gpu=use_gpu
                 )
-                print(f"Модель успешно загружена с контекстным окном {model_settings.get('context_size')} токенов!")
+                print(f"Модель успешно загружена на {device_type} с контекстным окном {model_settings.get('context_size')} токенов!")
                 return True
             except Exception as e:
                 print(f"ОШИБКА: Не удалось загрузить модель: {str(e)}")
@@ -169,7 +174,7 @@ def prepare_prompt(text, system_prompt=None):
 <|im_start|>assistant
 """
 
-def ask_agent(prompt, history=None, max_tokens=None):
+def ask_agent(prompt, history=None, max_tokens=None, streaming=False, stream_callback=None):
     if llm is None:
         raise ValueError("Модель не загружена. Пожалуйста, убедитесь, что модель инициализирована.")
     
@@ -184,32 +189,58 @@ def ask_agent(prompt, history=None, max_tokens=None):
         # Используем правильный формат запроса
         full_prompt = prepare_prompt(prompt)
         
-        # Выполняем генерацию с текущими параметрами из настроек
-        output = llm(
-            full_prompt,
-            max_tokens=max_tokens,     # Размер ответа
-            stop=["<|im_end|>", "<|im_start|>"],  # Стоп-токены для формата чата
-            echo=False,                # Не возвращать входной текст
-            temperature=model_settings.get("temperature"),
-            top_p=model_settings.get("top_p"),
-            repeat_penalty=model_settings.get("repeat_penalty")
-        )
-        
-        generated_text = output["choices"][0]["text"].strip()
-        
-        # Обрабатываем случай пустого вывода
-        if not generated_text:
-            print("Модель вернула пустой ответ, пробуем повторно с другими параметрами...")
-            # Более безопасные параметры для повторной попытки
-            output = llm(
-                prompt.strip(),  # Более простой формат
-                max_tokens=256,  # Уменьшенное число токенов
-                temperature=0.5, # Более низкая температура
-                echo=False
+        # Если включен режим потоковой генерации
+        if streaming and stream_callback:
+            # Инициализируем переменную для накопления текста
+            accumulated_text = ""
+            
+            # Создаем генератор для потоковой обработки
+            generator = llm(
+                full_prompt,
+                max_tokens=max_tokens,
+                stop=["<|im_end|>", "<|im_start|>"],
+                echo=False,
+                temperature=model_settings.get("temperature"),
+                top_p=model_settings.get("top_p"),
+                repeat_penalty=model_settings.get("repeat_penalty"),
+                stream=True  # Включаем потоковую генерацию
             )
+            
+            # Обрабатываем каждый фрагмент
+            for output in generator:
+                chunk = output["choices"][0]["text"]
+                accumulated_text += chunk
+                # Вызываем колбэк с текущим фрагментом
+                stream_callback(chunk, accumulated_text)
+            
+            return accumulated_text
+        else:
+            # Обычная генерация без стриминга
+            output = llm(
+                full_prompt,
+                max_tokens=max_tokens,     # Размер ответа
+                stop=["<|im_end|>", "<|im_start|>"],  # Стоп-токены для формата чата
+                echo=False,                # Не возвращать входной текст
+                temperature=model_settings.get("temperature"),
+                top_p=model_settings.get("top_p"),
+                repeat_penalty=model_settings.get("repeat_penalty")
+            )
+            
             generated_text = output["choices"][0]["text"].strip()
-        
-        return generated_text
+            
+            # Обрабатываем случай пустого вывода
+            if not generated_text:
+                print("Модель вернула пустой ответ, пробуем повторно с другими параметрами...")
+                # Более безопасные параметры для повторной попытки
+                output = llm(
+                    prompt.strip(),  # Более простой формат
+                    max_tokens=256,  # Уменьшенное число токенов
+                    temperature=0.5, # Более низкая температура
+                    echo=False
+                )
+                generated_text = output["choices"][0]["text"].strip()
+            
+            return generated_text
     except Exception as e:
         print(f"ОШИБКА при генерации ответа: {str(e)}")
         # Вместо непосредственной передачи ошибки, возвращаем сообщение об ошибке

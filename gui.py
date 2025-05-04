@@ -37,21 +37,32 @@ class Signals(QObject):
     transcription_complete = pyqtSignal(bool, str)
     progress_update = pyqtSignal(int)
     online_transcription_result = pyqtSignal(dict)
+    streaming_chunk_ready = pyqtSignal(str, str)  # сигнал для стриминга (chunk, accumulated_text)
 
 # Класс для фонового получения ответов от модели
 class AgentThread(QThread):
-    def __init__(self, signals, message, for_voice=False):
+    def __init__(self, signals, message, for_voice=False, streaming=None):
         super().__init__()
         self.signals = signals
         self.message = message
         self.for_voice = for_voice
+        # Если streaming не указан явно, берем из настроек модели
+        self.streaming = streaming if streaming is not None else model_settings.get("streaming", False)
         
     def run(self):
         try:
-            # Получаем ответ от модели
-            response = ask_agent(self.message)
+            # Функция обратного вызова для потоковой генерации
+            def stream_callback(chunk, accumulated_text):
+                self.signals.streaming_chunk_ready.emit(chunk, accumulated_text)
             
-            # Отправляем сигнал с ответом
+            # Получаем ответ от модели
+            response = ask_agent(
+                self.message, 
+                streaming=self.streaming,
+                stream_callback=stream_callback if self.streaming else None
+            )
+            
+            # Отправляем сигнал с полным ответом
             if self.for_voice:
                 self.signals.voice_response_ready.emit(response)
             else:
@@ -357,6 +368,12 @@ class ModelSettingsDialog(QDialog):
         # Создаем форму для настроек
         form_layout = QFormLayout()
         
+        # Выбор устройства (CPU/GPU)
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(["CPU", "GPU"])
+        self.device_combo.setCurrentIndex(1 if self.current_settings.get("use_gpu", False) else 0)
+        form_layout.addRow("Устройство вычислений:", self.device_combo)
+        
         # Размер контекста
         self.context_size_spin = QSpinBox()
         self.context_size_spin.setRange(512, 16384)
@@ -414,6 +431,12 @@ class ModelSettingsDialog(QDialog):
         self.verbose_combo.setCurrentIndex(0 if self.current_settings["verbose"] else 1)
         form_layout.addRow("Подробный вывод:", self.verbose_combo)
         
+        # Потоковая генерация
+        self.streaming_combo = QComboBox()
+        self.streaming_combo.addItems(["Включена", "Выключена"])
+        self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", False) else 1)
+        form_layout.addRow("Потоковая генерация:", self.streaming_combo)
+        
         # Кнопки
         button_layout = QHBoxLayout()
         
@@ -442,6 +465,7 @@ class ModelSettingsDialog(QDialog):
     def reset_to_defaults(self):
         """Сброс настроек к значениям по умолчанию"""
         # Сбрасываем значения в форме
+        self.device_combo.setCurrentIndex(0)  # CPU по умолчанию
         self.context_size_spin.setValue(2048)
         self.output_tokens_spin.setValue(512)
         self.batch_size_spin.setValue(512)
@@ -450,6 +474,7 @@ class ModelSettingsDialog(QDialog):
         self.top_p_spin.setValue(0.95)
         self.repeat_penalty_spin.setValue(1.05)
         self.verbose_combo.setCurrentIndex(0)
+        self.streaming_combo.setCurrentIndex(0)  # Потоковая генерация включена по умолчанию
     
     def get_settings(self):
         """Получение настроек из формы"""
@@ -462,8 +487,10 @@ class ModelSettingsDialog(QDialog):
             "top_p": self.top_p_spin.value(),
             "repeat_penalty": self.repeat_penalty_spin.value(),
             "verbose": self.verbose_combo.currentIndex() == 0,
+            "use_gpu": self.device_combo.currentIndex() == 1,  # GPU выбран, если индекс = 1
             "use_mmap": True,  # Оставляем эти параметры неизменными
-            "use_mlock": False
+            "use_mlock": False,
+            "streaming": self.streaming_combo.currentIndex() == 0  # Streaming включен, если индекс = 0
         }
 
 class MainWindow(QMainWindow):
@@ -486,6 +513,11 @@ class MainWindow(QMainWindow):
         self.signals.transcription_complete.connect(self.handle_transcription_complete)
         self.signals.progress_update.connect(self.update_progress_bar)
         self.signals.online_transcription_result.connect(self.handle_online_transcription)
+        self.signals.streaming_chunk_ready.connect(self.handle_streaming_chunk)
+        
+        # Флаг для отслеживания активной потоковой генерации
+        self.streaming_active = False
+        self.current_stream_message = ""
         
         # Настройка предпочтений
         self.model_config = ModelConfig()
@@ -1375,6 +1407,16 @@ class MainWindow(QMainWindow):
         self.voice_status.setText("Генерирую ответ...")
         self.recognition_active = True
         
+        # Сбрасываем флаг потоковой генерации
+        self.streaming_active = False
+        
+        # Получаем настройку потоковой генерации
+        use_streaming = model_settings.get("streaming", False)
+        
+        # Если стриминг отключен, показываем индикатор загрузки
+        if not use_streaming:
+            self.voice_history.append('<span style="color: #888888;">Ассистент печатает...</span>')
+        
         # Приостанавливаем распознавание речи на время ответа
         if self.voice_recognition_thread:
             self.voice_recognition_thread.pause()
@@ -1383,96 +1425,31 @@ class MainWindow(QMainWindow):
         self.agent_thread = AgentThread(self.signals, text, for_voice=True)
         self.agent_thread.start()
     
-    def handle_voice_response(self, response):
-        """Обработка ответа от модели для голосового режима"""
-        # Добавляем ответ в историю
-        self.append_voice_message("Ассистент", response)
-        
-        # Озвучиваем ответ
-        speaker = self.model_config.config.get("voice_speaker", "baya")
-        threading.Thread(target=self.speak_and_resume, args=(response, speaker), daemon=True).start()
-        
-    def speak_and_resume(self, text, speaker):
-        """Озвучивает текст и возобновляет прослушивание"""
-        # Озвучиваем текст
-        speak_text(text, speaker)
-        
-        # Возобновляем прослушивание
-        self.recognition_active = False
-        
-        # Возвращаем статус в исходное состояние
-        if self.recognition_active:
-            self.voice_status.setText("Слушаю... Говорите в микрофон")
-            # Возобновляем распознавание речи
-            if self.voice_recognition_thread:
-                self.voice_recognition_thread.resume()
-        else:
-            self.voice_status.setText("Ожидание...")
-    
-    def handle_voice_error(self, error_message):
-        """Обработка ошибок голосового режима"""
-        self.append_voice_message("Ошибка", error_message)
-        self.stop_voice_recognition()
-    
-    def append_voice_message(self, sender, message):
-        """Добавление сообщения в историю голосового чата"""
-        color = "#0066cc" if sender == "Вы" else "#009933"
-        if sender == "Ошибка":
-            color = "#cc0000"
-        elif sender == "Система":
-            color = "#888888"
-            
-        timestamp = QDateTime.currentDateTime().toString("hh:mm")
-        self.voice_history.append(f'<span style="color: {color};">[{timestamp}] <b>{sender}:</b></span> {message}')
-        self.voice_history.append("<br>")
-        
-        # Прокручиваем до конца
-        cursor = self.voice_history.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.voice_history.setTextCursor(cursor)
-    
-    def append_message(self, sender, message):
-        """Добавление сообщения в историю чата"""
-        color = "#0066cc" if sender == "Вы" else "#009933"
-        self.chat_history.append(f'<span style="font-weight: bold; color: {color};">{sender}:</span> {message}')
-        self.chat_history.append('<br>')  # Пустая строка после сообщения
-    
-    def send_message(self):
-        """Отправка сообщения"""
-        message = self.chat_input.text().strip()
-        if not message:
-            return
-        
-        # Очищаем поле ввода
-        self.chat_input.clear()
-        
-        # Добавляем сообщение пользователя
-        self.append_message("Вы", message)
-        
-        # Сохраняем в историю
-        save_to_memory("Пользователь", message)
-        
-        # Блокируем интерфейс
-        self.chat_input.setEnabled(False)
-        self.send_button.setEnabled(False)
-        
-        # Показываем индикатор
-        self.chat_history.append('<span style="color: #888888;">Ассистент печатает...</span>')
-        
-        # Запускаем поток для получения ответа
-        self.agent_thread = AgentThread(self.signals, message)
-        self.agent_thread.start()
-    
     def handle_response(self, response):
         """Обработка ответа от модели"""
-        # Восстанавливаем кнопку
+        # Восстанавливаем элементы интерфейса
         self.send_button.setEnabled(True)
+        self.chat_input.setEnabled(True)
+        self.chat_input.setFocus()
         
-        # Добавляем ответ в историю чата
-        self.append_message("Агент", response)
+        # Если был потоковый режим, то полный ответ уже отображен
+        if self.streaming_active:
+            self.streaming_active = False
+            return
         
-        # Если это ответ на запрос из вкладки документов
-        if self.tabs.currentIndex() == 2:  # Вкладка "Документы"
+        # Если не было потокового режима (стриминг отключен)
+        current_tab_index = self.tabs.currentIndex()
+        
+        # Удаляем сообщение "Ассистент печатает..."
+        if current_tab_index == 0:  # Текстовый чат
+            html = self.chat_history.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.chat_history.setHtml(html)
+            self.append_message("Агент", response)
+        elif current_tab_index == 2:  # Документы
+            html = self.docs_chat_area.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.docs_chat_area.setHtml(html)
             self.docs_send_btn.setEnabled(True)
             self.append_docs_message("Агент", response)
     
@@ -1487,6 +1464,34 @@ class MainWindow(QMainWindow):
         # Восстанавливаем интерфейс
         self.chat_input.setEnabled(True)
         self.chat_input.setFocus()
+    
+    def send_message(self):
+        """Отправка сообщения в чат"""
+        # Получаем текст из поля ввода
+        message = self.chat_input.text().strip()
+        
+        # Если сообщение пустое, ничего не делаем
+        if not message:
+            return
+            
+        # Добавляем сообщение пользователя в историю чата
+        self.append_message("Пользователь", message)
+        
+        # Очищаем поле ввода
+        self.chat_input.clear()
+        
+        # Добавляем индикатор "ассистент печатает..."
+        self.chat_history.append('<span style="color: #888888;">Ассистент печатает...</span>')
+        
+        # Отключаем кнопку отправки на время генерации ответа
+        self.send_button.setEnabled(False)
+        
+        # Создаем поток для обработки сообщения
+        # Получаем настройки из конфигурации
+        streaming = self.model_config.config.get("streaming", False)
+        self.agent_thread = AgentThread(self.signals, message, streaming=streaming)
+        self.agent_thread.finished.connect(lambda: self.send_button.setEnabled(True))
+        self.agent_thread.start()
     
     def load_document(self):
         """Загрузка документа"""
@@ -1545,6 +1550,16 @@ class MainWindow(QMainWindow):
             self.append_docs_message("Система", "Нет загруженных документов. Пожалуйста, загрузите документы перед выполнением запроса.")
             return
         
+        # Сбрасываем флаг потоковой генерации
+        self.streaming_active = False
+        
+        # Получаем настройку потоковой генерации
+        use_streaming = model_settings.get("streaming", False)
+        
+        # Если стриминг отключен, показываем индикатор загрузки
+        if not use_streaming:
+            self.docs_chat_area.append('<span style="color: #888888;">Ассистент печатает...</span>')
+        
         # Запускаем обработку в отдельном потоке
         self.doc_thread = DocumentThread(self.signals, self.doc_processor, query=query)
         self.doc_thread.start()
@@ -1554,17 +1569,26 @@ class MainWindow(QMainWindow):
     
     def append_docs_message(self, sender, message):
         """Добавление сообщения в историю чата с документами"""
-        timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
+        color = "#0066cc" if sender == "Вы" else "#009933"
+        if sender == "Ошибка":
+            color = "#cc0000"
+        elif sender == "Система":
+            color = "#888888"
+            
+        timestamp = QDateTime.currentDateTime().toString("HH:mm")
         
         cursor = self.docs_chat_area.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         
-        # Форматирование имени отправителя
-        cursor.insertHtml(f'<p><span style="font-weight: bold; color: {"#0066cc" if sender == "Вы" else "#cc0000"};">[{timestamp}] {sender}:</span><br/>')
+        # Форматируем HTML для сообщения с улучшенным стилем
+        html = f'<p><span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> '
         
         # Добавляем сообщение с переносами строк
         message_formatted = message.replace('\n', '<br/>')
-        cursor.insertHtml(f'{message_formatted}</p>')
+        html += f'{message_formatted}</p>'
+        
+        # Вставляем HTML
+        cursor.insertHtml(html)
         
         # Прокручиваем вниз
         self.docs_chat_area.setTextCursor(cursor)
@@ -1988,6 +2012,237 @@ class MainWindow(QMainWindow):
                     "Тема изменена",
                     "Тема оформления успешно изменена."
                 )
+
+    def handle_streaming_chunk(self, chunk, accumulated_text):
+        """Обработка фрагмента потоковой генерации"""
+        # Определяем, на какой вкладке происходит потоковая генерация
+        current_tab_index = self.tabs.currentIndex()
+        
+        # Обновляем текст в соответствующей вкладке
+        if current_tab_index == 0:  # Текстовый чат
+            self.update_streaming_message_in_chat(chunk, accumulated_text)
+        elif current_tab_index == 1:  # Голосовой чат
+            self.update_streaming_message_in_voice(chunk, accumulated_text)
+        elif current_tab_index == 2:  # Документы
+            self.update_streaming_message_in_docs(chunk, accumulated_text)
+
+    def update_streaming_message_in_chat(self, chunk, accumulated_text):
+        """Обновление потокового сообщения в текстовом чате"""
+        # Если это первый фрагмент сообщения
+        if not self.streaming_active:
+            self.streaming_active = False
+            # Добавляем новое сообщение с начальным текстом
+            color = "#009933"  # цвет для сообщений ассистента
+            timestamp = QDateTime.currentDateTime().toString("HH:mm")
+            
+            html = f'''
+            <div style="margin-bottom: 10px;">
+                <div style="white-space: pre-wrap;">
+                    <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> <span id="streaming-message">{chunk}</span>
+                </div>
+            </div>
+            '''
+            
+            # Добавляем сообщение в историю чата
+            self.chat_history.append(html)
+            self.current_stream_message = chunk
+        else:
+            # Обновляем существующее сообщение
+            html = self.chat_history.toHtml()
+            
+            # Заменяем содержимое span с id="streaming-message" на новый текст
+            updated_html = html.replace(
+                f'<span id="streaming-message">{self.current_stream_message}</span>', 
+                f'<span id="streaming-message">{accumulated_text}</span>'
+            )
+            
+            self.chat_history.setHtml(updated_html)
+            self.current_stream_message = accumulated_text
+            
+            # Прокручиваем до конца
+            cursor = self.chat_history.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.chat_history.setTextCursor(cursor)
+
+    def update_streaming_message_in_voice(self, chunk, accumulated_text):
+        """Обновление потокового сообщения в голосовом чате"""
+        # Если это первый фрагмент сообщения
+        if not self.streaming_active:
+            self.streaming_active = False
+            # Добавляем новое сообщение с начальным текстом
+            color = "#009933"  # цвет для сообщений ассистента
+            timestamp = QDateTime.currentDateTime().toString("HH:mm")
+            
+            html = f'''
+            <div style="margin-bottom: 10px;">
+                <div style="white-space: pre-wrap;">
+                    <span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> <span id="streaming-voice-message">{chunk}</span>
+                </div>
+            </div>
+            '''
+            
+            # Добавляем сообщение в историю голосового чата
+            self.voice_history.append(html)
+            self.current_stream_message = chunk
+        else:
+            # Обновляем существующее сообщение
+            html = self.voice_history.toHtml()
+            
+            # Заменяем содержимое span с id="streaming-voice-message" на новый текст
+            updated_html = html.replace(
+                f'<span id="streaming-voice-message">{self.current_stream_message}</span>', 
+                f'<span id="streaming-voice-message">{accumulated_text}</span>'
+            )
+            
+            self.voice_history.setHtml(updated_html)
+            self.current_stream_message = accumulated_text
+            
+            # Прокручиваем до конца
+            cursor = self.voice_history.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.voice_history.setTextCursor(cursor)
+
+    def update_streaming_message_in_docs(self, chunk, accumulated_text):
+        """Обновление потокового сообщения в чате документов"""
+        # Если это первый фрагмент сообщения
+        if not self.streaming_active:
+            self.streaming_active = False
+            # Добавляем новое сообщение с начальным текстом
+            color = "#009933"  # цвет для сообщений ассистента
+            timestamp = QDateTime.currentDateTime().toString("HH:mm")
+            
+            cursor = self.docs_chat_area.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            
+            # Форматируем HTML для сообщения
+            html = f'<p><span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> '
+            html += f'<span id="streaming-docs-message">{chunk}</span></p>'
+            
+            # Вставляем HTML
+            cursor.insertHtml(html)
+            self.current_stream_message = chunk
+        else:
+            # Обновляем существующее сообщение
+            html = self.docs_chat_area.toHtml()
+            
+            # Заменяем содержимое span с id="streaming-docs-message" на новый текст
+            updated_html = html.replace(
+                f'<span id="streaming-docs-message">{self.current_stream_message}</span>', 
+                f'<span id="streaming-docs-message">{accumulated_text}</span>'
+            )
+            
+            self.docs_chat_area.setHtml(updated_html)
+            self.current_stream_message = accumulated_text
+            
+            # Прокручиваем до конца
+            cursor = self.docs_chat_area.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.docs_chat_area.setTextCursor(cursor)
+
+    def append_message(self, sender, message, error=False):
+        """Добавление сообщения в историю чата"""
+        # Определяем цвет в зависимости от отправителя
+        if error:
+            color = "#FF0000"  # красный для ошибок
+        elif sender == "Пользователь":
+            color = "#0066CC"  # синий для пользователя
+        else:
+            color = "#009933"  # зеленый для ассистента
+        
+        # Форматируем текущее время
+        timestamp = QDateTime.currentDateTime().toString("HH:mm")
+        
+        # Форматируем сообщение в HTML
+        formatted_message = message.replace("\n", "<br>")
+        html = f'''
+        <div style="margin-bottom: 10px;">
+            <div style="white-space: pre-wrap;">
+                <span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}
+            </div>
+        </div>
+        '''
+        
+        # Добавляем сообщение в историю чата
+        self.chat_history.append(html)
+        
+        # Прокручиваем до конца
+        self.chat_history.moveCursor(QTextCursor.MoveOperation.End)
+
+    def append_voice_message(self, sender, message, error=False):
+        """Добавление сообщения в историю голосового чата"""
+        # Определяем цвет в зависимости от отправителя
+        if error:
+            color = "#FF0000"  # красный для ошибок
+        elif sender == "Пользователь":
+            color = "#0066CC"  # синий для пользователя
+        else:
+            color = "#009933"  # зеленый для ассистента
+        
+        # Форматируем текущее время
+        timestamp = QDateTime.currentDateTime().toString("HH:mm")
+        
+        # Форматируем сообщение в HTML
+        formatted_message = message.replace("\n", "<br>")
+        html = f'''
+        <div style="margin-bottom: 10px;">
+            <div style="white-space: pre-wrap;">
+                <span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}
+            </div>
+        </div>
+        '''
+        
+        # Добавляем сообщение в историю голосового чата
+        self.voice_history.append(html)
+        
+        # Прокручиваем до конца
+        self.voice_history.moveCursor(QTextCursor.MoveOperation.End)
+
+    def handle_voice_response(self, response):
+        """Обработка ответа от модели для голосового режима"""
+        # Если был потоковый режим, то полный ответ уже отображен
+        if self.streaming_active:
+            self.streaming_active = False
+        else:
+            # Удаляем сообщение "Ассистент печатает..." если оно есть
+            html = self.voice_history.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.voice_history.setHtml(html)
+            
+            # Добавляем ответ в историю
+            self.append_voice_message("Ассистент", response)
+        
+        # Озвучиваем ответ
+        speaker = self.model_config.config.get("voice_speaker", "baya")
+        threading.Thread(target=self.speak_and_resume, args=(response, speaker), daemon=True).start()
+
+    def speak_and_resume(self, text, speaker="baya"):
+        """Озвучивание текста с последующим возобновлением распознавания"""
+        try:
+            # Если распознавание активно, приостанавливаем его на время озвучивания
+            if self.recognition_active and self.voice_recognition_thread:
+                self.voice_recognition_thread.pause()
+            
+            # Озвучиваем текст при помощи голосового синтезатора
+            voice = Voice(speaker)
+            voice.say(text)
+            
+            # Возобновляем распознавание, если оно было активно
+            if self.recognition_active and self.voice_recognition_thread:
+                self.voice_recognition_thread.resume()
+        except Exception as e:
+            print(f"Ошибка при озвучивании: {e}")
+            # Все равно возобновляем распознавание в случае ошибки
+            if self.recognition_active and self.voice_recognition_thread:
+                self.voice_recognition_thread.resume()
+
+    def handle_voice_error(self, error):
+        """Обработка ошибок голосового режима"""
+        # Отображаем ошибку в истории голосового чата
+        self.append_voice_message("Система", f"Ошибка: {error}", error=True)
+        
+        # Если распознавание голоса активно, останавливаем его
+        if self.recognition_active:
+            self.stop_voice_recognition()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
