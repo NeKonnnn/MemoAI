@@ -115,41 +115,27 @@ class TranscriptionThread(QThread):
         
     def run(self):
         try:
-            # Устанавливаем начальный прогресс
-            self.signals.progress_update.emit(5)
-            
-            # Устанавливаем функцию обратного вызова для обновления прогресса
-            def progress_callback(progress):
-                self.signals.progress_update.emit(progress)
-                
-            # Передаем функцию обратного вызова транскрайберу
-            self.transcriber.set_progress_callback(progress_callback)
+            # Начинаем с 10% прогресса
+            self.signals.progress_update.emit(10)
             
             if self.file_path:
                 # Транскрибация файла
+                self.signals.progress_update.emit(30)
                 success, text = self.transcriber.process_audio_file(self.file_path)
             elif self.youtube_url:
                 # Транскрибация YouTube
+                self.signals.progress_update.emit(30)
                 success, text = self.transcriber.transcribe_youtube(self.youtube_url)
             else:
                 success, text = False, "Не указан источник для транскрибации"
             
-            # Сбрасываем функцию обратного вызова
-            self.transcriber.set_progress_callback(None)
-            
-            # Финальное обновление прогресса, независимо от результата
-            self.signals.progress_update.emit(100)
-            
             # Сигнализируем о завершении
+            self.signals.progress_update.emit(100)
             self.signals.transcription_complete.emit(success, text)
             
         except Exception as e:
-            # Отправляем сигнал об ошибке
             self.signals.progress_update.emit(100)
             self.signals.transcription_complete.emit(False, f"Ошибка при транскрибации: {str(e)}")
-            
-            # Сбрасываем функцию обратного вызова
-            self.transcriber.set_progress_callback(None)
 
 # Класс для распознавания голоса в отдельном потоке
 class VoiceRecognitionThread(QThread):
@@ -336,29 +322,59 @@ class ModelConfig:
                     new_model_path = self.config["models"][0]["path"]
                     self.config["current_model"] = new_model_path
                     
-                    # Сохраняем конфигурацию
-                    self.save_config()
+                    # Показываем прогресс-диалог
+                    progress_dialog = QProgressDialog("Загрузка новой модели...", "Отмена", 0, 0, self)
+                    progress_dialog.setWindowTitle("Загрузка модели")
+                    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress_dialog.setCancelButton(None)
+                    progress_dialog.setMinimumDuration(0)
+                    progress_dialog.show()
+                    QApplication.processEvents()
                     
-                    # Возвращаем информацию, что нужно загрузить новую модель
-                    return True, "new_model", new_model_path
-                else:
-                    # Если нет других моделей
-                    self.config["current_model"] = ""
+                    # Загружаем новую модель в отдельном потоке
+                    class ModelLoadThread(QThread):
+                        def __init__(self, model_path):
+                            super().__init__()
+                            self.model_path = model_path
+                            self.success = False
+                            
+                        def run(self):
+                            try:
+                                self.success = reload_model_by_path(self.model_path)
+                            except Exception:
+                                self.success = False
                     
-                    # Сохраняем конфигурацию
-                    self.save_config()
+                    # Запускаем поток и ждем завершения
+                    thread = ModelLoadThread(new_model_path)
+                    thread.start()
                     
-                    # Возвращаем информацию, что нужно показать предупреждение
-                    return True, "no_models", None
+                    while thread.isRunning():
+                        QApplication.processEvents()
+                        time.sleep(0.1)
+                    
+                    # Закрываем диалог
+                    progress_dialog.close()
+                    
+                    # Обновляем интерфейс
+                self.refresh_models_list()
+                self.update_current_model_info()
             else:
-                # Сохраняем конфигурацию
-                self.save_config()
-                
-                # Возвращаем информацию об успешном удалении
-                return True, "success", None
+                # Если нет других моделей
+                self.config["current_model"] = ""
+                QMessageBox.warning(
+                    self, 
+                    "Предупреждение", 
+                    "Удалена последняя модель. Для работы необходимо добавить модель."
+                )
             
-        # Если модель не найдена
-        return False, "not_found", None
+            # Сохраняем конфигурацию
+            self.save_config()
+            
+            # Обновляем интерфейс
+            self.refresh_models_list()
+            self.update_current_model_info()
+            
+            QMessageBox.information(self, "Успех", "Модель успешно удалена из списка")
 
 class AddModelDialog(QDialog):
     """Диалог добавления новой модели"""
@@ -1600,68 +1616,37 @@ class MainWindow(QMainWindow):
         )
         
         if confirm == QMessageBox.StandardButton.Yes:
+            # Проверяем, является ли удаляемая модель текущей
+            current_model = self.model_config.get_current_model()
+            is_current = current_model and current_model["path"] == model_path
+            
             # Удаляем модель
-            success, status, new_model_path = self.model_config.remove_model(model_path)
+            success = self.model_config.remove_model(model_path)
             
             if success:
-                if status == "new_model":
-                    # Необходимо загрузить новую модель
-                    first_model = None
-                    for model in self.model_config.config["models"]:
-                        if model["path"] == new_model_path:
-                            first_model = model
-                            break
+                # Если удалена текущая модель и есть другие модели, загружаем первую доступную
+                if is_current and self.model_config.config["models"]:
+                    # Получаем первую модель из списка
+                    first_model = self.model_config.config["models"][0]
+                    model_path = first_model["path"]
                     
-                    if first_model:
-                        # Показываем сообщение пользователю
-                        QMessageBox.information(
-                            self, 
-                            "Информация", 
-                            f"Текущая модель удалена, будет загружена модель {first_model['name']}"
-                        )
-                        
-                        # Показываем прогресс-диалог
-                        progress_dialog = QProgressDialog("Загрузка новой модели...", "Отмена", 0, 0, self)
-                        progress_dialog.setWindowTitle("Загрузка модели")
-                        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-                        progress_dialog.setCancelButton(None)
-                        progress_dialog.setMinimumDuration(0)
-                        progress_dialog.show()
-                        QApplication.processEvents()
-                        
-                        # Загружаем новую модель в отдельном потоке
-                        class ModelLoadThread(QThread):
-                            def __init__(self, model_path):
-                                super().__init__()
-                                self.model_path = model_path
-                                self.success = False
-                                
-                            def run(self):
-                                try:
-                                    self.success = reload_model_by_path(self.model_path)
-                                except Exception:
-                                    self.success = False
-                        
-                        # Запускаем поток и ждем завершения
-                        thread = ModelLoadThread(new_model_path)
-                        thread.start()
-                        
-                        while thread.isRunning():
-                            QApplication.processEvents()
-                            time.sleep(0.1)
-                        
-                        # Закрываем диалог
-                        progress_dialog.close()
-                elif status == "no_models":
-                    # Нет моделей после удаления
-                    QMessageBox.warning(
+                    # Показываем сообщение пользователю
+                    QMessageBox.information(
                         self, 
-                        "Предупреждение", 
-                        "Удалена последняя модель. Для работы необходимо добавить модель."
+                        "Информация", 
+                        f"Текущая модель удалена, будет загружена модель {first_model['name']}"
                     )
-                elif status == "success":
-                    # Успешное удаление обычной (не текущей) модели
-                    QMessageBox.information(self, "Успех", "Модель успешно удалена из списка")
+                    
+                    # Устанавливаем и загружаем новую модель
+                    self.model_config.set_current_model(model_path)
+                    
+                    # Создаем временный чекбокс для disable_gpu
+                    temp_checkbox = QCheckBox()
+                    temp_checkbox.setChecked(False)
+                    self.disable_gpu_checkbox = temp_checkbox
+                    
+                    # Загружаем модель
+                    self.set_current_model_with_gpu_option()
                 
                 # Обновляем интерфейс
                 self.refresh_models_list()
@@ -2196,7 +2181,7 @@ class MainWindow(QMainWindow):
         elif current_tab == self.docs_tab:
             # Обновляем сообщение в чате документов
             self.update_streaming_message_in_docs(chunk, accumulated_text)
-    
+
     def update_streaming_message_in_chat(self, chunk, accumulated_text):
         """Обновляет потоковое сообщение в текстовом чате"""
         # Если это первый фрагмент, удаляем сообщение "Ассистент печатает..."
@@ -2247,7 +2232,7 @@ class MainWindow(QMainWindow):
                 cursor.movePosition(QTextCursor.MoveOperation.End)
                 cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
                 cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
-                                  cursor.position())
+                                   cursor.position())
                 cursor.removeSelectedText()
                 
                 # Вставляем обновленное сообщение
@@ -2261,7 +2246,7 @@ class MainWindow(QMainWindow):
                 self.chat_history.setTextCursor(cursor)
             except Exception as e:
                 print(f"ОШИБКА при обновлении потокового сообщения в текстовом чате: {str(e)}")
-    
+
     def update_streaming_message_in_voice(self, chunk, accumulated_text):
         """Обновляет потоковое сообщение в голосовом чате"""
         # Если это первый фрагмент, удаляем сообщение "Ассистент печатает..."
@@ -2435,7 +2420,7 @@ class MainWindow(QMainWindow):
                     with open(filenames[0], 'w', encoding='utf-8') as f:
                         f.write(text)
                     QMessageBox.information(self, "Сохранено", f"Текст сохранен в файл:\n{filenames[0]}")
-                except Exception as e:
+            except Exception as e:
                     QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {str(e)}")
 
     def show_llm_settings(self):
@@ -2605,7 +2590,7 @@ class MainWindow(QMainWindow):
                             "Модель успешно загружена в режиме совместимости.\n"
                             "Рекомендуется оставить режим совместимости включенным для этой модели."
                         )
-                    else:
+        else:
                         # Возвращаем старую настройку режима совместимости
                         update_model_settings({"legacy_api": old_legacy_setting})
                         QMessageBox.warning(
@@ -2658,7 +2643,7 @@ class MainWindow(QMainWindow):
                             "Успех",
                             "Модель успешно перезагружена."
                         )
-                    else:
+        else:
                         QMessageBox.warning(
                             self,
                             "Ошибка",
@@ -2745,7 +2730,7 @@ class MainWindow(QMainWindow):
                             "Ошибка",
                             "Не удалось перезагрузить модель."
                         )
-                except Exception as e:
+        except Exception as e:
                     QMessageBox.critical(
                         self,
                         "Ошибка",
