@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QListWidget, QListWidgetItem, QFormLayout, QDialog,
                             QFrame, QScrollArea, QComboBox, QSpinBox, QDoubleSpinBox,
                             QCheckBox, QRadioButton, QButtonGroup, QProgressBar,
-                            QGroupBox, QSplitter)
-from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, pyqtSignal, QThread, QDateTime, QUrl, QUrlQuery
+                            QGroupBox, QSplitter, QProgressDialog)
+from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, pyqtSignal, QThread, QDateTime, QUrl, QUrlQuery, QTimer
 from PyQt6.QtGui import QFont, QIcon, QColor, QTextCursor, QTextDocument
 
 # Импорты для распознавания голоса
@@ -22,7 +22,7 @@ import sounddevice as sd
 # Добавим в импорты pyperclip для более надежного копирования
 import pyperclip
 
-from agent import ask_agent, update_model_settings, model_settings
+from agent import ask_agent, update_model_settings, model_settings, reload_model_by_path, get_model_info
 from memory import save_to_memory
 from voice import speak_text, check_vosk_model, VOSK_MODEL_PATH, SAMPLE_RATE
 from document_processor import DocumentProcessor
@@ -304,6 +304,47 @@ class ModelConfig:
                 return model
                 
         return None
+    
+    def remove_model(self, model_path):
+        """Удаление выбранной модели"""
+        # Проверяем, существует ли модель в конфигурации
+        if any(model["path"] == model_path for model in self.config["models"]):
+            # Удаляем модель из списка
+            self.config["models"] = [
+                model for model in self.config["models"] 
+                if model["path"] != model_path
+            ]
+            
+            # Если удаляется текущая модель, выбираем новую
+            if self.config["current_model"] == model_path:
+                if self.config["models"]:
+                    # Устанавливаем новую текущую модель
+                    new_model_path = self.config["models"][0]["path"]
+                    self.config["current_model"] = new_model_path
+                    
+                    # Сохраняем конфигурацию
+                    self.save_config()
+                    
+                    # Возвращаем информацию, что нужно загрузить новую модель
+                    return True, "new_model", new_model_path
+                else:
+                    # Если нет других моделей
+                    self.config["current_model"] = ""
+                    
+                    # Сохраняем конфигурацию
+                    self.save_config()
+                    
+                    # Возвращаем информацию, что нужно показать предупреждение
+                    return True, "no_models", None
+            else:
+                # Сохраняем конфигурацию
+                self.save_config()
+                
+                # Возвращаем информацию об успешном удалении
+                return True, "success", None
+            
+        # Если модель не найдена
+        return False, "not_found", None
 
 class AddModelDialog(QDialog):
     """Диалог добавления новой модели"""
@@ -361,7 +402,7 @@ class AddModelDialog(QDialog):
         return self.path_edit.text()
 
 class ModelSettingsDialog(QDialog):
-    """Диалог настроек модели LLM"""
+    """Диалог настроек LLM модели"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки LLM модели")
@@ -444,6 +485,15 @@ class ModelSettingsDialog(QDialog):
         self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", True) else 1)
         form_layout.addRow("Потоковая генерация:", self.streaming_combo)
         
+        # Режим совместимости (для несовместимых моделей)
+        self.legacy_api_checkbox = QCheckBox()
+        self.legacy_api_checkbox.setChecked(self.current_settings.get("legacy_api", False))
+        self.legacy_api_checkbox.setToolTip(
+            "Включите эту опцию, если модель вызывает ошибку 'unknown model architecture'.\n"
+            "Помогает с новыми моделями Qwen, Phi, Yi и другими, не поддерживаемыми llama.cpp напрямую."
+        )
+        form_layout.addRow("Режим совместимости для других архитектур:", self.legacy_api_checkbox)
+        
         # Кнопки
         button_layout = QHBoxLayout()
         
@@ -481,7 +531,8 @@ class ModelSettingsDialog(QDialog):
         self.top_p_spin.setValue(0.95)
         self.repeat_penalty_spin.setValue(1.05)
         self.verbose_combo.setCurrentIndex(0)
-        self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", True) else 1)  # Потоковая генерация включена по умолчанию
+        self.streaming_combo.setCurrentIndex(0)  # Потоковая генерация включена по умолчанию
+        self.legacy_api_checkbox.setChecked(False)  # Режим совместимости выключен по умолчанию
     
     def get_settings(self):
         """Получение настроек из формы"""
@@ -497,7 +548,8 @@ class ModelSettingsDialog(QDialog):
             "use_gpu": self.device_combo.currentIndex() == 1,  # GPU выбран, если индекс = 1
             "use_mmap": True,  # Оставляем эти параметры неизменными
             "use_mlock": False,
-            "streaming": self.streaming_combo.currentIndex() == 0  # Streaming включен, если индекс = 0
+            "streaming": self.streaming_combo.currentIndex() == 0,  # Streaming включен, если индекс = 0
+            "legacy_api": self.legacy_api_checkbox.isChecked()  # Режим совместимости
         }
 
 # Добавим класс для расширения QTextEdit с нашей обработкой ссылок
@@ -514,7 +566,8 @@ class CodeTextEdit(QTextEdit):
             a { text-decoration: none; color: #0066cc; }
             .code-block { background-color: #272822; border: 1px solid #1e1f1c; border-radius: 4px; margin: 10px 0; overflow: hidden; }
             .code-header { background-color: #1e1f1c; padding: 8px 12px; border-bottom: 1px solid #1e1f1c; display: flex; justify-content: space-between; align-items: center; }
-            .copy-button { background-color: #0066CC; color: white; border: none; cursor: pointer; padding: 4px 12px; border-radius: 3px; font-weight: bold; text-decoration: none; }
+            .copy-button { background-color: #0066CC; color: white; border: none; cursor: pointer; padding: 4px 12px; border-radius: 6px; font-weight: bold; text-decoration: none; margin-left: auto; }
+            .copy-button:hover { background-color: #0077EE; }
             pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; font-family: 'Consolas', 'Courier New', monospace; color: #f8f8f2; background-color: #272822; }
         """)
     
@@ -676,15 +729,15 @@ class MainWindow(QMainWindow):
             # URL-кодируем содержимое для безопасной передачи в URL
             encoded_content = urllib.parse.quote(code_content)
             
-            # Создаем URL для копирования в буфер обмена
-            copy_url = f"/_copy_to_clipboard?code_text={encoded_content}"
+            # Создаем URL для копирования в буфер обмена с ID блока кода
+            copy_url = f"/_copy_to_clipboard?code_text={encoded_content}&code_id={code_id}"
             
             # Возвращаем HTML-разметку (используем одинарные кавычки для f-строки)
             return (
                 f'<div class="code-block">'
                 f'<div class="code-header">'
                 f'<span style="font-weight: bold; color: #f8f8f2;">{lang if lang else "Code"}</span>'
-                f'<a href="{copy_url}" class="copy-button">Копировать</a>'
+                f'<a href="{copy_url}" class="copy-button" id="{code_id}_btn">Копировать</a>'
                 f'</div>'
                 f'<pre id="{code_id}">{code_content}</pre>'
                 f'</div>'
@@ -723,6 +776,12 @@ class MainWindow(QMainWindow):
         llm_settings_button.clicked.connect(self.show_llm_settings)
         self.sidebar_layout.addWidget(llm_settings_button)
         
+        # Кнопка информации о модели
+        model_info_button = QPushButton("Информация о модели")
+        model_info_button.setMinimumHeight(40)
+        model_info_button.clicked.connect(self.show_model_info_dialog)
+        self.sidebar_layout.addWidget(model_info_button)
+        
         # Кнопка настроек голосового режима
         voice_button = QPushButton("Голосовой режим")
         voice_button.setMinimumHeight(40)
@@ -741,10 +800,14 @@ class MainWindow(QMainWindow):
         # Информация о текущей модели
         current_model = self.model_config.get_current_model()
         model_name = current_model["name"] if current_model else "Нет"
-        model_info = QLabel(f"Текущая модель:\n{model_name}")
-        model_info.setWordWrap(True)
-        model_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sidebar_layout.addWidget(model_info)
+        self.model_info_label = QLabel(f"Текущая модель:\n{model_name}")
+        self.model_info_label.setWordWrap(True)
+        self.model_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_layout.addWidget(self.model_info_label)
+
+        # При запуске приложения мы не загружаем модель сразу,
+        # т.к. это может вызвать проблемы, потому что модель уже загружена
+        # в initialize_model при импорте agent.py
     
     def setup_header(self):
         """Настройка верхней панели"""
@@ -1269,39 +1332,179 @@ class MainWindow(QMainWindow):
         
         layout = QVBoxLayout(dialog)
         
-        # Список моделей
+        # Информация о текущей модели
+        current_model = self.model_config.get_current_model()
+        current_model_path = current_model["path"] if current_model else "Не выбрана"
+        current_model_name = current_model["name"] if current_model else "Не выбрана"
+        
+        current_model_info = QLabel(f"Текущая модель: {current_model_name}")
+        current_model_info.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        layout.addWidget(current_model_info)
+        
+        # Кнопка информации о модели
+        model_info_button = QPushButton("Информация о модели")
+        model_info_button.clicked.connect(self.show_model_info_dialog)
+        layout.addWidget(model_info_button)
+        
+        # Разделитель
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+        
+        # Чекбокс для отключения GPU
+        self.disable_gpu_checkbox = QCheckBox("Отключить GPU для этой модели")
+        self.disable_gpu_checkbox.setToolTip(
+            "Если модель вызывает ошибки на GPU, попробуйте загрузить её в режиме CPU.\n"
+            "Это может помочь с несовместимыми моделями, но будет работать медленнее."
+        )
+        layout.addWidget(self.disable_gpu_checkbox)
+        
+        # Добавляем метку для списка моделей
         models_label = QLabel("Доступные модели:")
-        models_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         layout.addWidget(models_label)
         
+        # Список моделей
         self.models_list = QListWidget()
-        self.refresh_models_list()
+        self.models_list.setMinimumHeight(200)
         layout.addWidget(self.models_list)
         
-        # Кнопки управления
+        # Кнопки управления моделями
         buttons_layout = QHBoxLayout()
         
-        add_button = QPushButton("Добавить")
+        # Кнопка выбора модели
+        select_button = QPushButton("Выбрать модель")
+        select_button.clicked.connect(self.set_current_model_with_gpu_option)
+        buttons_layout.addWidget(select_button)
+        
+        # Кнопка добавления модели
+        add_button = QPushButton("Добавить модель")
         add_button.clicked.connect(self.add_model)
-        
-        remove_button = QPushButton("Удалить")
-        remove_button.clicked.connect(self.remove_model)
-        
-        set_current_button = QPushButton("Установить как текущую")
-        set_current_button.clicked.connect(self.set_current_model)
-        
         buttons_layout.addWidget(add_button)
+        
+        # Кнопка удаления модели
+        remove_button = QPushButton("Удалить модель")
+        remove_button.clicked.connect(self.remove_model)
         buttons_layout.addWidget(remove_button)
-        buttons_layout.addWidget(set_current_button)
         
         layout.addLayout(buttons_layout)
         
-        # Кнопка закрытия
-        close_button = QPushButton("Закрыть")
-        close_button.clicked.connect(dialog.accept)
-        layout.addWidget(close_button)
+        # Обновляем список моделей
+        self.refresh_models_list()
         
+        # Показываем диалог
         dialog.exec()
+        
+        # Обновляем информацию о текущей модели
+        self.update_current_model_info()
+        
+    def set_current_model_with_gpu_option(self):
+        """Установка выбранной модели с учетом опции GPU"""
+        selected_items = self.models_list.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Ошибка", "Выберите модель")
+            return
+            
+        selected_item = selected_items[0]
+        model_path = selected_item.data(Qt.ItemDataRole.UserRole)
+        model_name = selected_item.text().replace("✓ ", "").replace(" (текущая)", "")
+        
+        # Получаем состояние чекбокса отключения GPU
+        disable_gpu = self.disable_gpu_checkbox.isChecked()
+        
+        # Если нужно отключить GPU для этой модели, временно меняем настройки
+        original_gpu_setting = None
+        if disable_gpu:
+            # Сохраняем текущую настройку
+            original_gpu_setting = model_settings.get("use_gpu")
+            # Временно отключаем GPU
+            update_model_settings({"use_gpu": False})
+        
+        # Перед сменой модели показываем индикатор загрузки
+        progress_dialog = QProgressDialog(f"Загрузка модели {model_name}...", "Отмена", 0, 0, self)
+        progress_dialog.setWindowTitle("Загрузка модели")
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setCancelButton(None)  # Убираем кнопку отмены
+        progress_dialog.setMinimumDuration(0)  # Показываем сразу
+        progress_dialog.show()
+        QApplication.processEvents()
+        
+        # Сначала устанавливаем как текущую в конфигурации
+        self.model_config.set_current_model(model_path)
+            
+        # Выполняем действие в отдельном потоке
+        class ModelLoadThread(QThread):
+            def __init__(self, model_path):
+                super().__init__()
+                self.model_path = model_path
+                self.success = False
+                self.error = None
+                self.retries = 0
+                self.max_retries = 2  # Максимальное число попыток
+                
+            def run(self):
+                while self.retries < self.max_retries and not self.success:
+                    try:
+                        # Попытка загрузить модель
+                        self.success = reload_model_by_path(self.model_path)
+                        if not self.success:
+                            self.error = "Не удалось загрузить модель"
+                            self.retries += 1
+                            # Ждем перед повторной попыткой
+                            import time
+                            time.sleep(2)
+                    except Exception as e:
+                        self.error = str(e)
+                        self.retries += 1
+                        # Ждем перед повторной попыткой
+                        import time
+                        time.sleep(2)
+        
+        # Создаем и запускаем поток
+        thread = ModelLoadThread(model_path)
+        thread.start()
+        
+        # Ждем завершения потока, обновляя интерфейс
+        while thread.isRunning():
+            QApplication.processEvents()
+            time.sleep(0.1)
+        
+        # Закрываем диалог
+        progress_dialog.close()
+        
+        # Возвращаем исходную настройку GPU, если была изменена
+        if original_gpu_setting is not None:
+            update_model_settings({"use_gpu": original_gpu_setting})
+        
+        # Проверяем результат
+        if thread.success:
+            gpu_mode = "CPU" if disable_gpu else "GPU"
+            QMessageBox.information(self, "Успех", f"Модель {model_name} успешно загружена в режиме {gpu_mode}")
+        else:
+            error_msg = thread.error if thread.error else "Неизвестная ошибка при смене модели"
+            retry_msg = f"Выполнено попыток: {thread.retries}" if thread.retries > 0 else ""
+            gpu_msg = "Режим GPU был отключен для этой загрузки." if disable_gpu else ""
+            
+            error_dialog = QMessageBox(self)
+            error_dialog.setIcon(QMessageBox.Icon.Warning)
+            error_dialog.setWindowTitle("Ошибка при загрузке модели")
+            error_dialog.setText(f"Не удалось загрузить модель {model_name}")
+            error_dialog.setInformativeText(f"Ошибка: {error_msg}\n{retry_msg}\n{gpu_msg}")
+            error_dialog.setDetailedText(
+                "Рекомендации по решению проблемы:\n"
+                "1. Проверьте, что файл модели не поврежден\n"
+                "2. Убедитесь, что у вас достаточно оперативной памяти\n"
+                "3. Для GPU-версии проверьте, что ваша видеокарта поддерживает модель\n"
+                "4. Попробуйте перезапустить приложение перед сменой модели\n"
+                "5. Для больших моделей отключите GPU-режим в настройках LLM"
+            )
+            error_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+            error_dialog.exec()
+        
+        # Обновляем интерфейс
+        self.refresh_models_list()
+        self.update_current_model_info()
     
     def refresh_models_list(self):
         """Обновление списка моделей"""
@@ -1321,6 +1524,18 @@ class MainWindow(QMainWindow):
                 item.setFont(font)
                 
             self.models_list.addItem(item)
+        
+        # Обновляем информацию о текущей модели в боковой панели
+        self.update_current_model_info()
+    
+    def update_current_model_info(self):
+        """Обновление информации о текущей модели в боковой панели"""
+        # Получаем информацию о текущей модели
+        current_model = self.model_config.get_current_model()
+        model_name = current_model["name"] if current_model else "Нет"
+        
+        # Обновляем текст метки
+        self.model_info_label.setText(f"Текущая модель:\n{model_name}")
     
     def add_model(self):
         """Добавление новой модели"""
@@ -1347,6 +1562,7 @@ class MainWindow(QMainWindow):
             if success:
                 QMessageBox.information(self, "Успех", "Модель успешно добавлена")
                 self.refresh_models_list()
+                self.update_current_model_info()
             else:
                 QMessageBox.warning(self, "Ошибка", "Такая модель уже добавлена")
     
@@ -1370,38 +1586,74 @@ class MainWindow(QMainWindow):
         )
         
         if confirm == QMessageBox.StandardButton.Yes:
-            # Удаляем модель из списка
-            self.model_config.config["models"] = [
-                model for model in self.model_config.config["models"] 
-                if model["path"] != model_path
-            ]
+            # Удаляем модель
+            success, status, new_model_path = self.model_config.remove_model(model_path)
             
-            # Если удаляется текущая модель, выбираем новую
-            if self.model_config.config["current_model"] == model_path:
-                if self.model_config.config["models"]:
-                    self.model_config.config["current_model"] = self.model_config.config["models"][0]["path"]
-                else:
-                    self.model_config.config["current_model"] = ""
+            if success:
+                if status == "new_model":
+                    # Необходимо загрузить новую модель
+                    first_model = None
+                    for model in self.model_config.config["models"]:
+                        if model["path"] == new_model_path:
+                            first_model = model
+                            break
                     
-            self.model_config.save_config()
-            self.refresh_models_list()
-    
-    def set_current_model(self):
-        """Установка выбранной модели как текущей"""
-        selected_items = self.models_list.selectedItems()
-        
-        if not selected_items:
-            QMessageBox.warning(self, "Ошибка", "Выберите модель")
-            return
-            
-        selected_item = selected_items[0]
-        model_path = selected_item.data(Qt.ItemDataRole.UserRole)
-        
-        success = self.model_config.set_current_model(model_path)
-        
-        if success:
-            QMessageBox.information(self, "Успех", "Модель установлена как текущая")
-            self.refresh_models_list()
+                    if first_model:
+                        # Показываем сообщение пользователю
+                        QMessageBox.information(
+                            self, 
+                            "Информация", 
+                            f"Текущая модель удалена, будет загружена модель {first_model['name']}"
+                        )
+                        
+                        # Показываем прогресс-диалог
+                        progress_dialog = QProgressDialog("Загрузка новой модели...", "Отмена", 0, 0, self)
+                        progress_dialog.setWindowTitle("Загрузка модели")
+                        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                        progress_dialog.setCancelButton(None)
+                        progress_dialog.setMinimumDuration(0)
+                        progress_dialog.show()
+                        QApplication.processEvents()
+                        
+                        # Загружаем новую модель в отдельном потоке
+                        class ModelLoadThread(QThread):
+                            def __init__(self, model_path):
+                                super().__init__()
+                                self.model_path = model_path
+                                self.success = False
+                                
+                            def run(self):
+                                try:
+                                    self.success = reload_model_by_path(self.model_path)
+                                except Exception:
+                                    self.success = False
+                        
+                        # Запускаем поток и ждем завершения
+                        thread = ModelLoadThread(new_model_path)
+                        thread.start()
+                        
+                        while thread.isRunning():
+                            QApplication.processEvents()
+                            time.sleep(0.1)
+                        
+                        # Закрываем диалог
+                        progress_dialog.close()
+                elif status == "no_models":
+                    # Нет моделей после удаления
+                    QMessageBox.warning(
+                        self, 
+                        "Предупреждение", 
+                        "Удалена последняя модель. Для работы необходимо добавить модель."
+                    )
+                elif status == "success":
+                    # Успешное удаление обычной (не текущей) модели
+                    QMessageBox.information(self, "Успех", "Модель успешно удалена из списка")
+                
+                # Обновляем интерфейс
+                self.refresh_models_list()
+                self.update_current_model_info()
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось удалить модель")
     
     def show_voice_settings(self):
         """Настройки голосового режима"""
@@ -1511,6 +1763,7 @@ class MainWindow(QMainWindow):
         
         # Сбрасываем флаг потоковой генерации
         self.streaming_active = False
+        self.current_stream_message = ""
         
         # Получаем настройку потоковой генерации
         use_streaming = model_settings.get("streaming", True)
@@ -1547,13 +1800,13 @@ class MainWindow(QMainWindow):
             html = self.chat_history.toHtml()
             html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
             self.chat_history.setHtml(html)
-            self.append_message("Агент", response)
+            self.append_message("Ассистент", response)
         elif current_tab_index == 2:  # Документы
             html = self.docs_chat_area.toHtml()
             html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
             self.docs_chat_area.setHtml(html)
             self.docs_send_btn.setEnabled(True)
-            self.append_docs_message("Агент", response)
+            self.append_docs_message("Ассистент", response)
     
     def handle_error(self, error):
         """Обработчик ошибки"""
@@ -1577,10 +1830,17 @@ class MainWindow(QMainWindow):
             return
             
         # Добавляем сообщение пользователя в историю чата
-        self.append_message("Пользователь", message)
+        self.append_message("Вы", message)
+        
+        # Сохраняем сообщение пользователя
+        save_to_memory("Пользователь", message)
         
         # Очищаем поле ввода
         self.chat_input.clear()
+        
+        # Сбрасываем флаг потоковой генерации, если он был активен
+        self.streaming_active = False
+        self.current_stream_message = ""
         
         # Добавляем индикатор "ассистент печатает..."
         self.chat_history.append('<span style="color: #888888;">Ассистент печатает...</span>')
@@ -1590,7 +1850,7 @@ class MainWindow(QMainWindow):
         
         # Создаем поток для обработки сообщения
         # Получаем настройки из конфигурации
-        streaming = self.model_config.config.get("streaming", True)
+        streaming = model_settings.get("streaming", True)
         self.agent_thread = AgentThread(self.signals, message, streaming=streaming)
         self.agent_thread.finished.connect(lambda: self.send_button.setEnabled(True))
         self.agent_thread.start()
@@ -1598,7 +1858,7 @@ class MainWindow(QMainWindow):
     def load_document(self):
         """Загрузка документа"""
         file_dialog = QFileDialog()
-        file_dialog.setNameFilter("Документы (*.pdf *.docx *.xlsx *.xls)")
+        file_dialog.setNameFilter("Документы (*.pdf *.docx *.xlsx *.xls *.txt *.jpg *.jpeg *.png *.webp)")
         
         if file_dialog.exec():
             filenames = file_dialog.selectedFiles()
@@ -1647,6 +1907,9 @@ class MainWindow(QMainWindow):
         # Добавляем запрос в историю чата
         self.append_docs_message("Вы", query)
         
+        # Сохраняем сообщение пользователя
+        save_to_memory("Пользователь", query)
+        
         # Проверяем наличие загруженных документов
         if not self.doc_processor.get_document_list():
             self.append_docs_message("Система", "Нет загруженных документов. Пожалуйста, загрузите документы перед выполнением запроса.")
@@ -1654,6 +1917,7 @@ class MainWindow(QMainWindow):
         
         # Сбрасываем флаг потоковой генерации
         self.streaming_active = False
+        self.current_stream_message = ""
         
         # Получаем настройку потоковой генерации
         use_streaming = model_settings.get("streaming", True)
@@ -1705,8 +1969,10 @@ class MainWindow(QMainWindow):
     def update_streaming_message_in_docs(self, chunk, accumulated_text):
         """Обновляет потоковое сообщение в чате с документами"""
         # Если это первый фрагмент, добавляем новый параграф
-        if not self.streaming_active:
-            self.streaming_active = True
+        if self.current_stream_message == "":
+            html = self.docs_chat_area.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.docs_chat_area.setHtml(html)
             
             # Форматируем сообщение, обрабатывая блоки кода
             formatted_text = self.format_code_blocks(accumulated_text, prefix="docs_stream_code")
@@ -1801,6 +2067,7 @@ class MainWindow(QMainWindow):
         # Если был потоковый режим, то полный ответ уже отображен
         if self.streaming_active:
             self.streaming_active = False
+            self.current_stream_message = ""
         else:
             # Удаляем сообщение "Ассистент печатает..." если оно есть
             html = self.voice_history.toHtml()
@@ -1864,6 +2131,7 @@ class MainWindow(QMainWindow):
             # Получаем данные из запроса
             query = QUrlQuery(url.query())
             text = query.queryItemValue("code_text")
+            code_id = query.queryItemValue("code_id")
             
             # URL-декодируем текст
             import urllib.parse
@@ -1875,9 +2143,9 @@ class MainWindow(QMainWindow):
             # Копируем текст с помощью нашей функции
             success = self.copy_to_clipboard(text)
             
-            # Показываем уведомление о копировании
-            text_to_display = text[:20] + "..." if len(text) > 20 else text
-            self.statusBar().showMessage(f"Скопировано: {text_to_display}", 2000)
+            if success:
+                # Показываем уведомление о копировании рядом с кнопкой
+                self.statusBar().showMessage("Код скопирован в буфер обмена", 2000)
             
             return True
         
@@ -2222,7 +2490,7 @@ class MainWindow(QMainWindow):
             app.setStyleSheet("""
                 QWidget { background-color: #2d2d2d; color: #f0f0f0; }
                 QTextEdit, QLineEdit { background-color: #3d3d3d; color: #f0f0f0; border: 1px solid #555; }
-                QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; }
+                QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; border-radius: 6px; }
                 QPushButton:hover { background-color: #0077EE; }
                 QTabWidget::pane { border: 1px solid #555; }
                 QTabBar::tab { background-color: #333; color: #f0f0f0; padding: 8px 12px; margin-right: 2px; }
@@ -2236,7 +2504,7 @@ class MainWindow(QMainWindow):
             # Светлая тема - используем кастомную тему с синими кнопками
             app = QApplication.instance()
             app.setStyleSheet("""
-                QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; }
+                QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; border-radius: 6px; }
                 QPushButton:hover { background-color: #0077EE; }
             """)
 
@@ -2270,6 +2538,286 @@ class MainWindow(QMainWindow):
         
         # Прокручиваем до конца
         self.chat_history.moveCursor(QTextCursor.MoveOperation.End)
+
+    def show_model_info_dialog(self):
+        """Отображает диалог с подробной информацией о текущей модели"""
+        # Получаем информацию о модели
+        model_info = get_model_info()
+        
+        # Создаем диалог
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Информация о модели")
+        dialog.setMinimumSize(600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        if not model_info["loaded"]:
+            # Если модель не загружена
+            layout.addWidget(QLabel("Модель не загружена."))
+            layout.addWidget(QLabel(f"Путь к модели: {model_info['path']}"))
+            
+            # Добавляем кнопку для попытки загрузки в режиме совместимости
+            compatibility_button = QPushButton("Попробовать загрузить в режиме совместимости")
+            compatibility_button.setToolTip("Если модель имеет архитектуру не поддерживаемую llama.cpp напрямую (Qwen, Phi, Yi и др.)")
+            layout.addWidget(compatibility_button)
+            
+            # Обработчик нажатия
+            def try_load_with_legacy_mode():
+                try:
+                    dialog.close()
+                    # Показываем диалог загрузки
+                    progress_dialog = QProgressDialog("Загрузка модели в режиме совместимости...", "Отмена", 0, 0, self)
+                    progress_dialog.setWindowTitle("Загрузка модели")
+                    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress_dialog.setCancelButton(None)
+                    progress_dialog.setMinimumDuration(0)
+                    progress_dialog.show()
+                    QApplication.processEvents()
+                    
+                    # Временно включаем режим совместимости
+                    old_legacy_setting = model_settings.get("legacy_api", False)
+                    update_model_settings({"legacy_api": True})
+                    
+                    # Пробуем загрузить модель
+                    result = initialize_model()
+                    
+                    # Закрываем диалог загрузки
+                    progress_dialog.close()
+                    
+                    if result:
+                        QMessageBox.information(
+                            self,
+                            "Успех",
+                            "Модель успешно загружена в режиме совместимости.\n"
+                            "Рекомендуется оставить режим совместимости включенным для этой модели."
+                        )
+                    else:
+                        # Возвращаем старую настройку режима совместимости
+                        update_model_settings({"legacy_api": old_legacy_setting})
+                        QMessageBox.warning(
+                            self,
+                            "Ошибка",
+                            "Не удалось загрузить модель даже в режиме совместимости.\n"
+                            "Возможно, модель повреждена или не поддерживается."
+                        )
+                except Exception as e:
+                    # Возвращаем старую настройку режима совместимости
+                    update_model_settings({"legacy_api": old_legacy_setting})
+                    QMessageBox.critical(
+                        self,
+                        "Ошибка",
+                        f"Произошла ошибка при загрузке модели: {str(e)}"
+                    )
+            
+            compatibility_button.clicked.connect(try_load_with_legacy_mode)
+        elif "error" in model_info:
+            # Если произошла ошибка при получении информации
+            layout.addWidget(QLabel("Ошибка при получении информации о модели:"))
+            layout.addWidget(QLabel(model_info["error"]))
+            
+            # Добавляем кнопку для перезагрузки модели
+            reload_button = QPushButton("Перезагрузить модель")
+            layout.addWidget(reload_button)
+            
+            # Обработчик нажатия
+            def reload_model():
+                try:
+                    dialog.close()
+                    # Показываем диалог загрузки
+                    progress_dialog = QProgressDialog("Перезагрузка модели...", "Отмена", 0, 0, self)
+                    progress_dialog.setWindowTitle("Загрузка модели")
+                    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress_dialog.setCancelButton(None)
+                    progress_dialog.setMinimumDuration(0)
+                    progress_dialog.show()
+                    QApplication.processEvents()
+                    
+                    # Пробуем перезагрузить модель
+                    result = initialize_model()
+                    
+                    # Закрываем диалог загрузки
+                    progress_dialog.close()
+                    
+                    if result:
+                        QMessageBox.information(
+                            self,
+                            "Успех",
+                            "Модель успешно перезагружена."
+                        )
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "Ошибка",
+                            "Не удалось перезагрузить модель."
+                        )
+                except Exception as e:
+                    QMessageBox.critical(
+                        self,
+                        "Ошибка",
+                        f"Произошла ошибка при перезагрузке модели: {str(e)}"
+                    )
+        else:
+            # Если модель загружена успешно
+            # Основная информация
+            info_label = QLabel("Основная информация:")
+            info_label.setStyleSheet("font-weight: bold;")
+            layout.addWidget(info_label)
+            
+            # Создаем текстовую область для метаданных
+            metadata_text = QTextEdit()
+            metadata_text.setReadOnly(True)
+            
+            # Форматируем метаданные
+            metadata = model_info["metadata"]
+            if metadata:
+                # Базовая информация о модели
+                metadata_str = f"Название: {metadata.get('general.name', 'Неизвестно')}\n"
+                metadata_str += f"Архитектура: {metadata.get('general.architecture', 'Неизвестно')}\n"
+                metadata_str += f"Размер: {metadata.get('general.size_label', 'Неизвестно')}\n"
+                metadata_str += f"Организация: {metadata.get('general.organization', 'Неизвестно')}\n"
+                metadata_str += f"Версия: {metadata.get('general.version', 'Неизвестно')}\n"
+                metadata_str += f"Контекстное окно: {metadata.get('llama.context_length', model_info.get('n_ctx', 'Неизвестно'))}\n"
+                metadata_str += f"Размер эмбеддингов: {metadata.get('llama.embedding_length', 'Неизвестно')}\n"
+                metadata_str += f"Количество слоёв: {metadata.get('llama.block_count', 'Неизвестно')}\n"
+                metadata_str += f"Количество GPU слоёв: {model_info.get('n_gpu_layers', 0)}\n"
+                metadata_str += f"Путь к файлу: {model_info['path']}\n"
+                metadata_str += f"Режим совместимости: {'Включен' if model_settings.get('legacy_api', False) else 'Выключен'}\n\n"
+                
+                # Полные метаданные
+                metadata_str += "Полные метаданные:\n"
+                for key, value in metadata.items():
+                    metadata_str += f"{key}: {value}\n"
+            else:
+                metadata_str = "Метаданные недоступны"
+            
+            metadata_text.setText(metadata_str)
+            layout.addWidget(metadata_text)
+            
+            # Добавляем кнопки для управления моделью
+            buttons_layout = QHBoxLayout()
+            
+            # Кнопка для перезагрузки модели
+            reload_button = QPushButton("Перезагрузить модель")
+            buttons_layout.addWidget(reload_button)
+            
+            # Обработчик нажатия для перезагрузки
+            def reload_model():
+                try:
+                    dialog.close()
+                    # Показываем диалог загрузки
+                    progress_dialog = QProgressDialog("Перезагрузка модели...", "Отмена", 0, 0, self)
+                    progress_dialog.setWindowTitle("Загрузка модели")
+                    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress_dialog.setCancelButton(None)
+                    progress_dialog.setMinimumDuration(0)
+                    progress_dialog.show()
+                    QApplication.processEvents()
+                    
+                    # Пробуем перезагрузить модель
+                    result = initialize_model()
+                    
+                    # Закрываем диалог загрузки
+                    progress_dialog.close()
+                    
+                    if result:
+                        QMessageBox.information(
+                            self,
+                            "Успех",
+                            "Модель успешно перезагружена."
+                        )
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "Ошибка",
+                            "Не удалось перезагрузить модель."
+                        )
+                except Exception as e:
+                    QMessageBox.critical(
+                        self,
+                        "Ошибка",
+                        f"Произошла ошибка при перезагрузке модели: {str(e)}"
+                    )
+            
+            reload_button.clicked.connect(reload_model)
+            
+            # Кнопка для переключения режима совместимости
+            toggle_legacy_button = QPushButton(
+                "Выключить режим совместимости" if model_settings.get("legacy_api", False) 
+                else "Включить режим совместимости"
+            )
+            buttons_layout.addWidget(toggle_legacy_button)
+            
+            # Обработчик нажатия для переключения режима совместимости
+            def toggle_legacy_mode():
+                try:
+                    dialog.close()
+                    # Показываем диалог загрузки
+                    new_legacy_setting = not model_settings.get("legacy_api", False)
+                    
+                    # Показываем предупреждение при выключении режима
+                    if not new_legacy_setting and metadata.get('general.architecture', '').lower() != 'llama':
+                        confirm = QMessageBox.question(
+                            self,
+                            "Подтверждение",
+                            "Выключение режима совместимости может привести к ошибке загрузки "
+                            "для моделей с архитектурой, отличной от Llama.\n\n"
+                            "Вы уверены, что хотите выключить режим совместимости?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
+                        if confirm != QMessageBox.StandardButton.Yes:
+                            return
+                    
+                    progress_dialog = QProgressDialog(
+                        f"{'Выключение' if model_settings.get('legacy_api', False) else 'Включение'} "
+                        f"режима совместимости и перезагрузка модели...", 
+                        "Отмена", 0, 0, self
+                    )
+                    progress_dialog.setWindowTitle("Перезагрузка модели")
+                    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress_dialog.setCancelButton(None)
+                    progress_dialog.setMinimumDuration(0)
+                    progress_dialog.show()
+                    QApplication.processEvents()
+                    
+                    # Меняем настройку и перезагружаем модель
+                    update_model_settings({"legacy_api": new_legacy_setting})
+                    result = initialize_model()
+                    
+                    # Закрываем диалог загрузки
+                    progress_dialog.close()
+                    
+                    if result:
+                        QMessageBox.information(
+                            self,
+                            "Успех",
+                            f"Режим совместимости успешно {'выключен' if not new_legacy_setting else 'включен'}.\n"
+                            f"Модель перезагружена."
+                        )
+                    else:
+                        # Возвращаем старую настройку, если не удалось загрузить модель
+                        update_model_settings({"legacy_api": not new_legacy_setting})
+                        QMessageBox.warning(
+                            self,
+                            "Ошибка",
+                            f"Не удалось загрузить модель в {'обычном' if not new_legacy_setting else 'совместимом'} режиме."
+                        )
+                except Exception as e:
+                    QMessageBox.critical(
+                        self,
+                        "Ошибка",
+                        f"Произошла ошибка при переключении режима совместимости: {str(e)}"
+                    )
+            
+            toggle_legacy_button.clicked.connect(toggle_legacy_mode)
+            
+            layout.addLayout(buttons_layout)
+        
+        # Кнопка закрытия
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        
+        dialog.exec()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

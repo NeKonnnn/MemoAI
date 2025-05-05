@@ -42,6 +42,10 @@ class DocumentProcessor:
                 document_text = self.extract_text_from_pdf(file_path)
             elif file_extension in ['.xlsx', '.xls']:
                 document_text = self.extract_text_from_excel(file_path)
+            elif file_extension == '.txt':
+                document_text = self.extract_text_from_txt(file_path)
+            elif file_extension in ['.jpg', '.jpeg', '.png', '.webp']:
+                document_text = self.extract_text_from_image(file_path)
             else:
                 return False, f"Неподдерживаемый формат файла: {file_extension}"
             
@@ -110,6 +114,51 @@ class DocumentProcessor:
                     text_content.append("\t".join(row_values))
         
         return "\n".join(text_content)
+    
+    def extract_text_from_txt(self, file_path):
+        """Извлечение текста из TXT файла"""
+        try:
+            # Пробуем открыть файл как UTF-8
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        except UnicodeDecodeError:
+            # Если не удалось открыть как UTF-8, пробуем другие кодировки
+            encodings = ['cp1251', 'latin-1', 'koi8-r']
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as file:
+                        return file.read()
+                except UnicodeDecodeError:
+                    continue
+            
+            # Если все кодировки не подошли, открываем в бинарном режиме
+            with open(file_path, 'rb') as file:
+                content = file.read()
+                return str(content)
+
+    def extract_text_from_image(self, file_path):
+        """Извлечение текста из изображения с помощью OCR"""
+        try:
+            # Проверяем наличие библиотеки pytesseract
+            import pytesseract
+            from PIL import Image
+            
+            # Открываем изображение с помощью Pillow
+            img = Image.open(file_path)
+            
+            # Извлекаем текст с изображения
+            text = pytesseract.image_to_string(img, lang='rus+eng')
+            
+            # Если текст не извлечен, добавляем описание изображения
+            if not text.strip():
+                return f"[Изображение: {os.path.basename(file_path)}. OCR не смог извлечь текст.]"
+            
+            return text
+        except ImportError:
+            # Если pytesseract не установлен, возвращаем информацию о файле
+            return f"[Изображение: {os.path.basename(file_path)}. Для распознавания текста требуется установка pytesseract.]"
+        except Exception as e:
+            return f"[Изображение: {os.path.basename(file_path)}. Ошибка при обработке: {str(e)}]"
     
     def add_document_to_collection(self, text, doc_name):
         """Добавление документа в коллекцию и обновление векторного хранилища"""

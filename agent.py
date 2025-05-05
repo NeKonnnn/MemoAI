@@ -21,7 +21,8 @@ class ModelSettings:
             "top_p": 0.95,             # Top-p sampling
             "repeat_penalty": 1.05,    # Штраф за повторения
             "use_gpu": False,          # Использовать GPU
-            "streaming": True         # Использовать потоковую генерацию
+            "streaming": True,         # Использовать потоковую генерацию
+            "legacy_api": False        # Режим совместимости для несовместимых архитектур
         }
         self.settings = self.default_settings.copy()
         self.load_settings()
@@ -100,8 +101,27 @@ def initialize_model():
     
     # Освобождаем ресурсы, если модель уже была загружена
     if llm is not None:
-        del llm
-        llm = None
+        try:
+            # Сохраняем ссылку, чтобы очистить её позже
+            old_llm = llm
+            # Сбрасываем глобальную переменную перед удалением
+            llm = None
+            # Явно удаляем объект
+            del old_llm
+            
+            # Вызываем сборщик мусора несколько раз
+            import gc
+            gc.collect()
+            # Ждем некоторое время перед продолжением
+            import time
+            time.sleep(1)
+            # Повторяем еще раз для уверенности
+            gc.collect()
+            
+            print("Предыдущая модель успешно выгружена из памяти")
+        except Exception as e:
+            print(f"Ошибка при освобождении ресурсов: {str(e)}")
+            # Продолжаем, даже если не удалось освободить ресурсы
         
     try:
         model_to_use = MODEL_PATH
@@ -113,8 +133,80 @@ def initialize_model():
             use_gpu = model_settings.get("use_gpu", False)
             device_type = "GPU" if use_gpu else "CPU"
             print(f"Загружаю модель из: {model_to_use} (устройство: {device_type})")
+            
+            # Проверяем файл модели на наличие архитектуры
+            # Это помогает определить, нужно ли использовать legacy_api
+            legacy_mode = False
             try:
+                # Импортируем функцию для чтения метаданных модели
+                from llama_cpp.llama_grammar import LlamaGrammar
+                import json
+                import struct
+                
+                # Проверяем, является ли файл GGUF форматом
+                with open(model_to_use, "rb") as f:
+                    magic = f.read(4)
+                    if magic == b"GGUF":
+                        # Файл в формате GGUF, читаем метаданные для определения архитектуры
+                        f.seek(0)
+                        # Пропускаем magic + version + metadata_kv_count
+                        f.read(4 + 4 + 8)
+                        try:
+                            # Пытаемся прочитать ключи метаданных
+                            architecture_found = False
+                            for _ in range(100):  # Ограничиваем количество итераций для безопасности
+                                # Чтение длины ключа
+                                key_length_bytes = f.read(8)
+                                if not key_length_bytes:
+                                    break
+                                key_length = int.from_bytes(key_length_bytes, byteorder='little')
+                                
+                                # Чтение ключа
+                                key = f.read(key_length).decode('utf-8')
+                                
+                                # Чтение типа значения
+                                value_type = int.from_bytes(f.read(4), byteorder='little')
+                                
+                                if key == "general.architecture":
+                                    # Чтение длины значения (для строк)
+                                    if value_type == 3:  # STRING
+                                        value_length = int.from_bytes(f.read(8), byteorder='little')
+                                        value = f.read(value_length).decode('utf-8')
+                                        print(f"Обнаружена архитектура: {value}")
+                                        
+                                        # Проверяем, поддерживается ли архитектура
+                                        unsupported_archs = ["qwen", "qwen2", "qwen3", "phi", "yi", "mamba"]
+                                        if any(arch in value.lower() for arch in unsupported_archs):
+                                            print(f"Архитектура {value} может быть несовместима с llama-cpp напрямую, "
+                                                  f"будет использован режим совместимости")
+                                            legacy_mode = True
+                                        architecture_found = True
+                                        break
+                                    else:
+                                        # Пропускаем значение
+                                        f.seek(f.tell() + 8)  # Пропускаем размер значения
+                                else:
+                                    # Пропускаем значение
+                                    f.seek(f.tell() + 12)  # Пропускаем тип, размер и значение
+                            
+                            if not architecture_found:
+                                print("Архитектура не найдена в метаданных, будет использован обычный режим")
+                        except Exception as e:
+                            print(f"Ошибка при чтении метаданных модели: {str(e)}")
+            except Exception as e:
+                print(f"Не удалось проверить архитектуру модели: {str(e)}")
+            
+            try:
+                # Перед созданием новой модели вызываем сборщик мусора
+                import gc
+                gc.collect()
+                
                 # Параметры для модели с текущими настройками
+                # Если модель несовместима, используем legacy_api=True
+                use_legacy_api = model_settings.get("legacy_api", False) or legacy_mode
+                if use_legacy_api:
+                    print(f"Используется режим совместимости (legacy_api=True) для загрузки модели")
+                
                 llm = Llama(
                     model_path=model_to_use,
                     n_ctx=model_settings.get("context_size"),
@@ -124,12 +216,40 @@ def initialize_model():
                     verbose=model_settings.get("verbose"),
                     seed=42,                          # Фиксированное зерно для стабильности
                     n_threads=model_settings.get("n_threads"),
-                    use_gpu=use_gpu
+                    use_gpu=use_gpu,
+                    legacy_api=use_legacy_api         # Режим совместимости для несовместимых архитектур
                 )
                 print(f"Модель успешно загружена на {device_type} с контекстным окном {model_settings.get('context_size')} токенов!")
                 return True
             except Exception as e:
                 print(f"ОШИБКА: Не удалось загрузить модель: {str(e)}")
+                
+                # Если ошибка связана с архитектурой и мы не используем режим совместимости,
+                # попробуем еще раз с включенным режимом
+                if not use_legacy_api and "unknown model architecture" in str(e):
+                    print("Обнаружена несовместимая архитектура. Повторная попытка с режимом совместимости...")
+                    try:
+                        llm = Llama(
+                            model_path=model_to_use,
+                            n_ctx=model_settings.get("context_size"),
+                            n_batch=model_settings.get("batch_size"),
+                            use_mmap=model_settings.get("use_mmap"),
+                            use_mlock=model_settings.get("use_mlock"),
+                            verbose=model_settings.get("verbose"),
+                            seed=42,
+                            n_threads=model_settings.get("n_threads"),
+                            use_gpu=use_gpu,
+                            legacy_api=True    # Принудительно включаем режим совместимости
+                        )
+                        print(f"Модель успешно загружена в режиме совместимости на {device_type}!")
+                        return True
+                    except Exception as e2:
+                        print(f"ОШИБКА при повторной попытке с режимом совместимости: {str(e2)}")
+                
+                # Сбрасываем глобальную переменную, если произошла ошибка во время загрузки
+                llm = None
+                # Принудительно вызываем сборщик мусора
+                gc.collect()
                 raise
         else:
             print("ОШИБКА: Не удалось найти подходящую модель.")
@@ -158,6 +278,89 @@ def update_model_settings(new_settings):
     
     # Перезагружаем модель с новыми настройками
     return initialize_model()
+
+def reload_model_by_path(model_path):
+    """Перезагрузка модели с новым файлом модели"""
+    global MODEL_PATH, llm
+    
+    # Проверяем существование файла модели
+    if not os.path.exists(model_path):
+        print(f"ОШИБКА: Модель по указанному пути не найдена: {model_path}")
+        return False
+    
+    # Если текущая модель та же самая, возвращаем успех без перезагрузки
+    if MODEL_PATH == model_path and llm is not None:
+        print(f"Модель {model_path} уже загружена, перезагрузка не требуется")
+        return True
+    
+    try:
+        # Принудительный сброс всех ссылок на модель перед сменой
+        if llm is not None:
+            try:
+                # Сохраняем ссылку, чтобы очистить её позже
+                old_llm = llm
+                # Сбрасываем глобальную переменную перед удалением
+                llm = None
+                # Явно удаляем объект
+                del old_llm
+                
+                # Запускаем сборщик мусора несколько раз
+                import gc
+                gc.collect()
+                # Ждем некоторое время перед продолжением
+                import time
+                time.sleep(1)
+                # Повторяем еще раз для уверенности
+                gc.collect()
+                
+                print("Предыдущая модель успешно выгружена из памяти")
+            except Exception as e:
+                print(f"Ошибка при освобождении ресурсов: {str(e)}")
+        
+        # Делаем более длительную паузу перед загрузкой новой модели
+        import time
+        time.sleep(2)
+        
+        # Обновляем глобальный путь к модели
+        MODEL_PATH = model_path
+        print(f"Сменяем модель на: {model_path}")
+        
+        # Перезагружаем модель
+        return initialize_model()
+    except Exception as e:
+        print(f"ОШИБКА при смене модели: {str(e)}")
+        return False
+
+def get_model_info():
+    """Получение информации о текущей модели"""
+    if llm is None:
+        return {
+            "loaded": False,
+            "metadata": None,
+            "path": MODEL_PATH
+        }
+    
+    try:
+        try:
+            metadata = llm.model_metadata()
+        except AttributeError:
+            # Обработка случая, когда метод model_metadata отсутствует
+            print("Метод model_metadata не найден, возвращаем базовые метаданные")
+            metadata = {"general.name": "Неизвестно", "general.architecture": "Неизвестно"}
+        return {
+            "loaded": True,
+            "metadata": metadata,
+            "path": MODEL_PATH,
+            "n_ctx": llm.n_ctx(),
+            "n_gpu_layers": llm.params.n_gpu_layers
+        }
+    except Exception as e:
+        print(f"Ошибка при получении информации о модели: {e}")
+        return {
+            "loaded": True,
+            "error": str(e),
+            "path": MODEL_PATH
+        }
 
 def prepare_prompt(text, system_prompt=None):
     """Подготовка промпта в правильном формате"""

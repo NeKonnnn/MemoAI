@@ -9,9 +9,17 @@
       "name": "Qwen_Qwen3-8B-Q8_0.gguf",
       "path": "F:\\memoai\\models\\Qwen_Qwen3-8B-Q8_0.gguf",
       "description": "Модель Qwen_Qwen3-8B-Q8_0.gguf"
+    },
+    {
+      "name": "Qwen3-8B-128K-Q8_0.gguf",
+      "path": "F:/memoai/models/Qwen3-8B-128K-Q8_0.gguf"
+    },
+    {
+      "name": "DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf",
+      "path": "F:/memoai/models/DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf"
     }
   ],
-  "current_model": "F:\\memoai\\models\\model.gguf",
+  "current_model": "F:/memoai/models/DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf",
   "voice_speaker": "baya",
   "theme": "dark"
 }
