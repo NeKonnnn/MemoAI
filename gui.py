@@ -12,12 +12,15 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QFrame, QScrollArea, QComboBox, QSpinBox, QDoubleSpinBox,
                             QCheckBox, QRadioButton, QButtonGroup, QProgressBar,
                             QGroupBox, QSplitter)
-from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, pyqtSignal, QThread, QDateTime
-from PyQt6.QtGui import QFont, QIcon, QColor, QTextCursor
+from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QObject, pyqtSignal, QThread, QDateTime, QUrl, QUrlQuery
+from PyQt6.QtGui import QFont, QIcon, QColor, QTextCursor, QTextDocument
 
 # Импорты для распознавания голоса
 from vosk import Model, KaldiRecognizer
 import sounddevice as sd
+
+# Добавим в импорты pyperclip для более надежного копирования
+import pyperclip
 
 from agent import ask_agent, update_model_settings, model_settings
 from memory import save_to_memory
@@ -497,6 +500,35 @@ class ModelSettingsDialog(QDialog):
             "streaming": self.streaming_combo.currentIndex() == 0  # Streaming включен, если индекс = 0
         }
 
+# Добавим класс для расширения QTextEdit с нашей обработкой ссылок
+class CodeTextEdit(QTextEdit):
+    """Расширенный QTextEdit для обработки ссылок в блоках кода"""
+    linkClicked = pyqtSignal(QUrl)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        # Включаем поддержку ссылок
+        document = self.document()
+        document.setDefaultStyleSheet("""
+            a { text-decoration: none; color: #0066cc; }
+            .code-block { background-color: #272822; border: 1px solid #1e1f1c; border-radius: 4px; margin: 10px 0; overflow: hidden; }
+            .code-header { background-color: #1e1f1c; padding: 8px 12px; border-bottom: 1px solid #1e1f1c; display: flex; justify-content: space-between; align-items: center; }
+            .copy-button { background-color: #0066CC; color: white; border: none; cursor: pointer; padding: 4px 12px; border-radius: 3px; font-weight: bold; text-decoration: none; }
+            pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; font-family: 'Consolas', 'Courier New', monospace; color: #f8f8f2; background-color: #272822; }
+        """)
+    
+    def mousePressEvent(self, event):
+        """Обрабатывает клики по ссылкам"""
+        # Проверяем, был ли клик по ссылке
+        anchor = self.anchorAt(event.position().toPoint())
+        if anchor:
+            # Эмитируем сигнал с URL ссылки
+            self.linkClicked.emit(QUrl(anchor))
+        else:
+            # Для других случаев вызываем базовый обработчик
+            super().mousePressEvent(event)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -518,6 +550,11 @@ class MainWindow(QMainWindow):
         self.signals.progress_update.connect(self.update_progress_bar)
         self.signals.online_transcription_result.connect(self.handle_online_transcription)
         self.signals.streaming_chunk_ready.connect(self.handle_streaming_chunk)
+        
+        # Инициализируем переменные, которые будут созданы позже
+        self.chat_history = None
+        self.voice_history = None
+        self.docs_chat_area = None
         
         # Флаг для отслеживания активной потоковой генерации
         self.streaming_active = False
@@ -602,6 +639,64 @@ class MainWindow(QMainWindow):
         # Инициализация голосового распознавания
         self.voice_recognition_thread = None
         self.recognition_active = False
+        
+        # Настраиваем обработку URL-запросов для созданных виджетов QTextEdit
+        for widget in [self.chat_history, self.voice_history, self.docs_chat_area]:
+            if widget and isinstance(widget, CodeTextEdit):
+                widget.linkClicked.connect(self.handle_anchor_clicked)
+                
+    # Вспомогательная функция для форматирования блоков кода
+    def format_code_blocks(self, message, prefix="code"):
+        """
+        Форматирует блоки кода в сообщении, заменяя их на HTML с кнопкой копирования.
+        
+        Args:
+            message (str): Исходное сообщение с блоками кода
+            prefix (str): Префикс для генерации уникальных ID
+            
+        Returns:
+            str: Отформатированное сообщение с HTML-разметкой для блоков кода
+        """
+        import re
+        import uuid
+        import urllib.parse
+        
+        # Паттерн для поиска блоков кода
+        pattern = r'```(.*?)\n([\s\S]*?)```'
+        
+        # Функция для обработки найденного блока кода
+        def process_code_block(match):
+            # Извлекаем содержимое и язык
+            lang = match.group(1).strip() if match.group(1) else ""
+            code_content = match.group(2).replace("<", "&lt;").replace(">", "&gt;")
+            
+            # Генерируем уникальный ID для блока кода
+            code_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
+            
+            # URL-кодируем содержимое для безопасной передачи в URL
+            encoded_content = urllib.parse.quote(code_content)
+            
+            # Создаем URL для копирования в буфер обмена
+            copy_url = f"/_copy_to_clipboard?code_text={encoded_content}"
+            
+            # Возвращаем HTML-разметку (используем одинарные кавычки для f-строки)
+            return (
+                f'<div class="code-block">'
+                f'<div class="code-header">'
+                f'<span style="font-weight: bold; color: #f8f8f2;">{lang if lang else "Code"}</span>'
+                f'<a href="{copy_url}" class="copy-button">Копировать</a>'
+                f'</div>'
+                f'<pre id="{code_id}">{code_content}</pre>'
+                f'</div>'
+            )
+        
+        # Заменяем все блоки кода
+        formatted_message = re.sub(pattern, process_code_block, message)
+        
+        # Заменяем обычные переносы строк на <br>
+        formatted_message = formatted_message.replace("\n", "<br>")
+        
+        return formatted_message
     
     def setup_sidebar(self):
         """Настройка боковой панели (шторки)"""
@@ -670,9 +765,10 @@ class MainWindow(QMainWindow):
     def setup_chat_tab(self):
         """Настройка вкладки чата"""
         # История чата
-        self.chat_history = QTextEdit()
+        self.chat_history = CodeTextEdit()
         self.chat_history.setReadOnly(True)
         self.chat_history.setFont(QFont("Arial", 11))
+        self.chat_history.linkClicked.connect(self.handle_anchor_clicked)
         self.chat_layout.addWidget(self.chat_history)
         
         # Поле ввода и кнопка отправки
@@ -698,9 +794,10 @@ class MainWindow(QMainWindow):
     def setup_voice_tab(self):
         """Настройка вкладки голосового чата"""
         # История голосового чата
-        self.voice_history = QTextEdit()
+        self.voice_history = CodeTextEdit()
         self.voice_history.setReadOnly(True)
         self.voice_history.setFont(QFont("Arial", 11))
+        self.voice_history.linkClicked.connect(self.handle_anchor_clicked)
         self.voice_layout.addWidget(self.voice_history)
         
         # Панель управления голосовым режимом
@@ -765,8 +862,9 @@ class MainWindow(QMainWindow):
         chat_panel_layout.addWidget(chat_docs_header)
         
         # Область чата
-        self.docs_chat_area = QTextEdit()
+        self.docs_chat_area = CodeTextEdit()
         self.docs_chat_area.setReadOnly(True)
+        self.docs_chat_area.linkClicked.connect(self.handle_anchor_clicked)
         chat_panel_layout.addWidget(self.docs_chat_area)
         
         # Поле ввода и кнопка отправки
@@ -1573,642 +1671,79 @@ class MainWindow(QMainWindow):
     
     def append_docs_message(self, sender, message):
         """Добавление сообщения в историю чата с документами"""
-        color = "#0066cc" if sender == "Вы" else "#009933"
-        if sender == "Ошибка":
+        # Определяем цвет в зависимости от отправителя
+        if sender == "Вы":
+            color = "#0066cc"
+        elif sender == "Ошибка":
             color = "#cc0000"
         elif sender == "Система":
             color = "#888888"
+        else:
+            color = "#009933"  # для ассистента
             
+        # Форматируем текущее время
         timestamp = QDateTime.currentDateTime().toString("HH:mm")
         
-        cursor = self.docs_chat_area.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        # Форматируем сообщение, обрабатывая блоки кода
+        formatted_message = self.format_code_blocks(message, prefix="docs_code")
         
-        # Форматируем HTML для сообщения с улучшенным стилем
-        html = f'<p><span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> '
-        
-        # Добавляем сообщение с переносами строк
-        message_formatted = message.replace('\n', '<br/>')
-        html += f'{message_formatted}</p>'
-        
-        # Вставляем HTML
-        cursor.insertHtml(html)
-        
-        # Прокручиваем вниз
-        self.docs_chat_area.setTextCursor(cursor)
-        self.docs_chat_area.ensureCursorVisible()
-    
-    def browse_media_file(self):
-        """Выбор медиа-файла для транскрибации"""
-        file_dialog = QFileDialog()
-        file_dialog.setNameFilter("Медиа файлы (*.mp3 *.wav *.mp4 *.avi *.mov *.m4a *.flac *.webm *.mkv)")
-        
-        if file_dialog.exec():
-            filenames = file_dialog.selectedFiles()
-            if filenames:
-                self.transcribe_input.setText(filenames[0])
-                # Переключаем радиокнопку на файловый режим
-                self.file_radio.setChecked(True)
-    
-    def start_transcription(self):
-        """Начало процесса транскрибации"""
-        # Получаем источник
-        source = self.transcribe_input.text().strip()
-        if not source:
-            QMessageBox.warning(self, "Ошибка", "Укажите источник для транскрибации")
-            return
-        
-        # Определяем тип источника
-        is_file = self.file_radio.isChecked()
-        is_youtube = self.youtube_radio.isChecked()
-        
-        # Проверка валидности источника
-        if is_file and not os.path.exists(source):
-            QMessageBox.warning(self, "Ошибка", "Указанный файл не существует")
-            return
-        
-        if is_youtube and not (source.startswith("http://") or source.startswith("https://")):
-            QMessageBox.warning(self, "Ошибка", "Неверный формат URL")
-            return
-        
-        # Запускаем транскрибацию в отдельном потоке
-        self.transcribe_thread = TranscriptionThread(
-            self.signals, 
-            self.transcriber,
-            file_path=source if is_file else None,
-            youtube_url=source if is_youtube else None
+        # Создаем HTML для сообщения
+        html = (
+            f'<div style="margin-bottom: 10px;">'
+            f'<div style="white-space: pre-wrap;">'
+            f'<span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}'
+            f'</div>'
+            f'</div>'
         )
-        self.transcribe_thread.start()
         
-        # Деактивируем кнопку на время транскрибации
-        self.start_transcribe_btn.setEnabled(False)
-        self.start_transcribe_btn.setText("Транскрибация...")
+        # Добавляем сообщение в историю чата с документами
+        self.docs_chat_area.append(html)
         
-        # Сбрасываем прогресс
-        self.transcribe_progress.setValue(0)
-    
-    def update_progress_bar(self, value):
-        """Обновление индикатора прогресса"""
-        self.transcribe_progress.setValue(value)
-    
-    def handle_transcription_complete(self, success, text):
-        """Обработка результата транскрибации"""
-        # Восстанавливаем кнопку
-        self.start_transcribe_btn.setEnabled(True)
-        self.start_transcribe_btn.setText("Начать транскрибацию")
-        
-        if success:
-            # Отображаем результат
-            self.transcribe_result.setPlainText(text)
-        else:
-            # Отображаем ошибку
-            QMessageBox.warning(self, "Ошибка", text)
-            self.transcribe_result.setPlainText(f"Ошибка транскрибации: {text}")
-    
-    def copy_transcription(self):
-        """Копирование результата транскрибации в буфер обмена"""
-        text = self.transcribe_result.toPlainText()
-        if text:
-            clipboard = QApplication.clipboard()
-            clipboard.setText(text)
-            QMessageBox.information(self, "Скопировано", "Результат транскрибации скопирован в буфер обмена")
-    
-    def save_transcription(self):
-        """Сохранение результата транскрибации в файл"""
-        text = self.transcribe_result.toPlainText()
-        if not text:
-            return
-        
-        file_dialog = QFileDialog()
-        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        file_dialog.setNameFilter("Текстовые файлы (*.txt)")
-        file_dialog.setDefaultSuffix("txt")
-        
-        if file_dialog.exec():
-            filenames = file_dialog.selectedFiles()
-            if filenames:
-                try:
-                    with open(filenames[0], 'w', encoding='utf-8') as f:
-                        f.write(text)
-                    QMessageBox.information(self, "Сохранено", f"Результат транскрибации сохранен в файл {filenames[0]}")
-                except Exception as e:
-                    QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {str(e)}")
-    
-    def change_model_size(self, size):
-        """Изменение размера модели для транскрибации"""
-        self.transcriber.set_model_size(size)
-    
-    def change_transcription_language(self, language):
-        """Изменение языка для транскрибации"""
-        self.transcriber.set_language(language)
-    
-    def apply_theme(self):
-        """Применение выбранной темы к приложению"""
-        theme = self.model_config.config.get("theme", "light")
-        
-        if theme == "light":
-            self.apply_light_theme()
-        else:
-            self.apply_dark_theme()
-    
-    def apply_light_theme(self):
-        """Применение светлой темы"""
-        self.setStyleSheet("""
-            QMainWindow, QDialog {
-                background-color: #f8f8f8;
-            }
-            
-            QWidget#header {
-                background-color: #ffffff;
-                border-bottom: 1px solid #e0e0e0;
-            }
-            
-            QTextEdit {
-                background-color: white;
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                padding: 10px;
-                selection-background-color: #d0e8fa;
-                color: #333333;
-            }
-            
-            QLineEdit {
-                padding: 10px;
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                selection-background-color: #d0e8fa;
-                background-color: white;
-                color: #333333;
-            }
-            
-            QPushButton {
-                background-color: #4a86e8;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 16px;
-            }
-            
-            QPushButton:hover {
-                background-color: #3a76d8;
-            }
-            
-            QPushButton:pressed {
-                background-color: #2a66c8;
-            }
-            
-            QTabWidget::pane {
-                border: 1px solid #e0e0e0;
-                background-color: white;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-            }
-            
-            QTabBar::tab {
-                background-color: #e8e8e8;
-                border: 1px solid #e0e0e0;
-                border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                padding: 8px 16px;
-                margin-right: 2px;
-                color: #333333;
-            }
-            
-            QTabBar::tab:selected {
-                background-color: white;
-            }
-            
-            QListWidget {
-                background-color: white;
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                padding: 5px;
-                selection-background-color: #e0e0e0;
-                color: #333333;
-            }
-            
-            QListWidget::item {
-                padding: 5px;
-                border-radius: 4px;
-            }
-            
-            QListWidget::item:selected {
-                background-color: #e0e0e0;
-            }
-            
-            QLabel {
-                color: #333333;
-            }
-            
-            QComboBox, QSpinBox, QDoubleSpinBox {
-                background-color: white;
-                border: 1px solid #e0e0e0;
-                border-radius: 4px;
-                padding: 4px;
-                color: #333333;
-            }
-            
-            QComboBox::drop-down {
-                border: none;
-            }
-            
-            QComboBox QAbstractItemView {
-                background-color: white;
-                selection-background-color: #e0e0e0;
-                color: #333333;
-            }
-        """)
-    
-    def apply_dark_theme(self):
-        """Применение темной темы"""
-        self.setStyleSheet("""
-            QMainWindow, QDialog {
-                background-color: #2d2d2d;
-            }
-            
-            QWidget#header {
-                background-color: #333333;
-                border-bottom: 1px solid #444444;
-            }
-            
-            QTextEdit {
-                background-color: #3d3d3d;
-                border: 1px solid #444444;
-                border-radius: 8px;
-                padding: 10px;
-                selection-background-color: #505050;
-                color: #e0e0e0;
-            }
-            
-            QLineEdit {
-                padding: 10px;
-                border: 1px solid #444444;
-                border-radius: 8px;
-                selection-background-color: #505050;
-                background-color: #3d3d3d;
-                color: #e0e0e0;
-            }
-            
-            QPushButton {
-                background-color: #4a86e8;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 16px;
-            }
-            
-            QPushButton:hover {
-                background-color: #5a96f8;
-            }
-            
-            QPushButton:pressed {
-                background-color: #3a76d8;
-            }
-            
-            QTabWidget::pane {
-                border: 1px solid #444444;
-                background-color: #333333;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-            }
-            
-            QTabBar::tab {
-                background-color: #2d2d2d;
-                border: 1px solid #444444;
-                border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                padding: 8px 16px;
-                margin-right: 2px;
-                color: #e0e0e0;
-            }
-            
-            QTabBar::tab:selected {
-                background-color: #333333;
-            }
-            
-            QListWidget {
-                background-color: #3d3d3d;
-                border: 1px solid #444444;
-                border-radius: 8px;
-                padding: 5px;
-                selection-background-color: #505050;
-                color: #e0e0e0;
-            }
-            
-            QListWidget::item {
-                padding: 5px;
-                border-radius: 4px;
-            }
-            
-            QListWidget::item:selected {
-                background-color: #505050;
-            }
-            
-            QLabel {
-                color: #e0e0e0;
-            }
-            
-            QComboBox, QSpinBox, QDoubleSpinBox {
-                background-color: #3d3d3d;
-                border: 1px solid #444444;
-                border-radius: 4px;
-                padding: 4px;
-                color: #e0e0e0;
-            }
-            
-            QComboBox::drop-down {
-                border: none;
-            }
-            
-            QComboBox QAbstractItemView {
-                background-color: #3d3d3d;
-                selection-background-color: #505050;
-                color: #e0e0e0;
-            }
-        """)
-    
-    def show_llm_settings(self):
-        """Показать диалог настроек LLM"""
-        # Закрываем боковую панель
-        if self.sidebar_frame.width() > 0:
-            self.toggle_sidebar()
-        
-        # Создаем и показываем диалог настроек
-        dialog = ModelSettingsDialog(self)
-        
-        if dialog.exec():
-            # Если пользователь нажал "Сохранить", применяем новые настройки
-            new_settings = dialog.get_settings()
-            
-            # Показываем диалог с информацией о перезагрузке модели
-            QMessageBox.information(
-                self,
-                "Перезагрузка модели",
-                "Настройки сохранены. Модель будет перезагружена с новыми параметрами."
-            )
-            
-            # Применяем новые настройки
-            try:
-                update_model_settings(new_settings)
-                QMessageBox.information(
-                    self,
-                    "Успех",
-                    "Модель успешно перезагружена с новыми настройками."
-                )
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "Ошибка",
-                    f"Не удалось перезагрузить модель: {str(e)}"
-                )
-    
-    def show_interface_settings(self):
-        """Показать диалог настроек интерфейса"""
-        # Закрываем боковую панель
-        if self.sidebar_frame.width() > 0:
-            self.toggle_sidebar()
-        
-        # Создаем диалог
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Настройки интерфейса")
-        dialog.setMinimumWidth(400)
-        
-        layout = QVBoxLayout(dialog)
-        
-        # Настройка темы
-        theme_layout = QFormLayout()
-        theme_combo = QComboBox()
-        theme_combo.addItems(["Светлая тема", "Темная тема"])
-        current_theme = self.model_config.config.get("theme", "light")
-        theme_combo.setCurrentIndex(0 if current_theme == "light" else 1)
-        
-        theme_layout.addRow("Тема оформления:", theme_combo)
-        
-        # Кнопки
-        buttons_layout = QHBoxLayout()
-        
-        cancel_button = QPushButton("Отмена")
-        cancel_button.clicked.connect(dialog.reject)
-        
-        save_button = QPushButton("Сохранить")
-        save_button.clicked.connect(dialog.accept)
-        
-        buttons_layout.addStretch()
-        buttons_layout.addWidget(cancel_button)
-        buttons_layout.addWidget(save_button)
-        
-        # Добавляем в основной макет
-        layout.addLayout(theme_layout)
-        layout.addStretch()
-        layout.addLayout(buttons_layout)
-        
-        # Сохраняем настройки при принятии
-        if dialog.exec():
-            new_theme = "light" if theme_combo.currentIndex() == 0 else "dark"
-            if new_theme != self.model_config.config.get("theme", "light"):
-                self.model_config.config["theme"] = new_theme
-                self.model_config.save_config()
-                self.apply_theme()
-                QMessageBox.information(
-                    self,
-                    "Тема изменена",
-                    "Тема оформления успешно изменена."
-                )
-
-    def handle_streaming_chunk(self, chunk, accumulated_text):
-        """Обработка фрагмента потоковой генерации"""
-        print(f"DEBUG: Получен фрагмент: '{chunk}', полный текст: '{accumulated_text[:50]}...' (длина {len(accumulated_text)})")
-        # Определяем, на какой вкладке происходит потоковая генерация
-        current_tab_index = self.tabs.currentIndex()
-        
-        # Обновляем текст в соответствующей вкладке
-        if current_tab_index == 0:  # Текстовый чат
-            self.update_streaming_message_in_chat(chunk, accumulated_text)
-        elif current_tab_index == 1:  # Голосовой чат
-            self.update_streaming_message_in_voice(chunk, accumulated_text)
-        elif current_tab_index == 2:  # Документы
-            self.update_streaming_message_in_docs(chunk, accumulated_text)
-
-    def update_streaming_message_in_chat(self, chunk, accumulated_text):
-        """Обновление потокового сообщения в текстовом чате"""
-        if not self.streaming_active:
-            # Первый фрагмент сообщения - создаем новое сообщение
-            print(f"DEBUG: Создаем новое потоковое сообщение с текстом: '{accumulated_text[:50]}...'")
-            self.streaming_active = True
-            
-            # Добавляем новое сообщение с начальным текстом
-            color = "#009933"  # цвет для сообщений ассистента
-            timestamp = QDateTime.currentDateTime().toString("HH:mm")
-            
-            # Удаляем сообщение "Ассистент печатает..." если оно есть
-            html = self.chat_history.toHtml()
-            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
-            self.chat_history.setHtml(html)
-            
-            # Создаем HTML для нового сообщения без использования id
-            new_message = f'''
-            <div class="message">
-                <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
-                {accumulated_text}
-            </div>
-            '''
-            
-            # Добавляем сообщение в историю чата
-            self.chat_history.append(new_message)
-            
-            # Сохраняем текущий текст для последующих обновлений
-            self.current_stream_message = accumulated_text
-        else:
-            # Последующие фрагменты - обновляем последнее сообщение
-            try:
-                print(f"DEBUG: Обновляем сообщение, новый текст длиной {len(accumulated_text)} символов")
-                
-                # Создаем новое сообщение с обновленным текстом
-                color = "#009933"
-                timestamp = QDateTime.currentDateTime().toString("HH:mm")
-                
-                new_message = f'''
-                <div class="message">
-                    <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
-                    {accumulated_text}
-                </div>
-                '''
-                
-                # Удаляем последний параграф и добавляем новый
-                cursor = self.chat_history.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
-                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
-                                   cursor.position())
-                cursor.removeSelectedText()
-                
-                # Вставляем обновленное сообщение
-                cursor.insertHtml(new_message)
-                
-                # Обновляем сохраненный текст
-                self.current_stream_message = accumulated_text
-                
-                # Прокручиваем вниз
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                self.chat_history.setTextCursor(cursor)
-            except Exception as e:
-                print(f"ОШИБКА при обновлении потокового сообщения: {str(e)}")
-
-    def update_streaming_message_in_voice(self, chunk, accumulated_text):
-        """Обновление потокового сообщения в голосовом чате"""
-        if not self.streaming_active:
-            # Первый фрагмент сообщения - создаем новое сообщение
-            print(f"DEBUG: Создаем новое потоковое сообщение для голосового чата")
-            self.streaming_active = True
-            
-            # Добавляем новое сообщение с начальным текстом
-            color = "#009933"  # цвет для сообщений ассистента
-            timestamp = QDateTime.currentDateTime().toString("HH:mm")
-            
-            # Удаляем сообщение "Ассистент печатает..." если оно есть
-            html = self.voice_history.toHtml()
-            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
-            self.voice_history.setHtml(html)
-            
-            # Создаем HTML для нового сообщения без использования id
-            new_message = f'''
-            <div class="message">
-                <span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> 
-                {accumulated_text}
-            </div>
-            '''
-            
-            # Добавляем сообщение в историю чата
-            self.voice_history.append(new_message)
-            
-            # Сохраняем текущий текст для последующих обновлений
-            self.current_stream_message = accumulated_text
-        else:
-            # Последующие фрагменты - обновляем последнее сообщение
-            try:
-                print(f"DEBUG: Обновляем сообщение голосового чата")
-                
-                # Создаем новое сообщение с обновленным текстом
-                color = "#009933"
-                timestamp = QDateTime.currentDateTime().toString("HH:mm")
-                
-                new_message = f'''
-                <div class="message">
-                    <span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> 
-                    {accumulated_text}
-                </div>
-                '''
-                
-                # Удаляем последний параграф и добавляем новый
-                cursor = self.voice_history.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
-                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
-                                   cursor.position())
-                cursor.removeSelectedText()
-                
-                # Вставляем обновленное сообщение
-                cursor.insertHtml(new_message)
-                
-                # Обновляем сохраненный текст
-                self.current_stream_message = accumulated_text
-                
-                # Прокручиваем вниз
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                self.voice_history.setTextCursor(cursor)
-            except Exception as e:
-                print(f"ОШИБКА при обновлении потокового сообщения в голосовом чате: {str(e)}")
+        # Прокручиваем до конца
+        self.docs_chat_area.moveCursor(QTextCursor.MoveOperation.End)
 
     def update_streaming_message_in_docs(self, chunk, accumulated_text):
-        """Обновление потокового сообщения в чате документов"""
+        """Обновляет потоковое сообщение в чате с документами"""
+        # Если это первый фрагмент, добавляем новый параграф
         if not self.streaming_active:
-            # Первый фрагмент сообщения - создаем новое сообщение
-            print(f"DEBUG: Создаем новое потоковое сообщение для чата документов")
             self.streaming_active = True
             
-            # Добавляем новое сообщение с начальным текстом
-            color = "#009933"  # цвет для сообщений ассистента
+            # Форматируем сообщение, обрабатывая блоки кода
+            formatted_text = self.format_code_blocks(accumulated_text, prefix="docs_stream_code")
+            
+            # Создаем время
             timestamp = QDateTime.currentDateTime().toString("HH:mm")
             
-            # Удаляем сообщение "Ассистент печатает..." если оно есть
-            html = self.docs_chat_area.toHtml()
-            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
-            self.docs_chat_area.setHtml(html)
+            # Создаем HTML для нового сообщения 
+            color = "#009933"  # зеленый для ассистента
+            new_message = (
+                f'<div class="message">'
+                f'<span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> '
+                f'{formatted_text}'
+                f'</div>'
+            )
             
-            # Создаем новое сообщение без использования id
-            cursor = self.docs_chat_area.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            
-            # Форматируем HTML для сообщения
-            new_message = f'''
-            <div class="message">
-                <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
-                {accumulated_text}
-            </div>
-            '''
-            
-            # Вставляем HTML
-            cursor.insertHtml(new_message)
+            # Добавляем сообщение в историю чата
+            self.docs_chat_area.append(new_message)
             
             # Сохраняем текущий текст для последующих обновлений
             self.current_stream_message = accumulated_text
         else:
             # Последующие фрагменты - обновляем последнее сообщение
             try:
-                print(f"DEBUG: Обновляем сообщение в чате документов")
+                # Форматируем сообщение, обрабатывая блоки кода
+                formatted_text = self.format_code_blocks(accumulated_text, prefix="docs_stream_code")
                 
                 # Создаем новое сообщение с обновленным текстом
-                color = "#009933"
+                color = "#009933"  # зеленый для ассистента
                 timestamp = QDateTime.currentDateTime().toString("HH:mm")
                 
-                new_message = f'''
-                <div class="message">
-                    <span style="font-weight: bold; color: {color};">[{timestamp}] Агент:</span> 
-                    {accumulated_text}
-                </div>
-                '''
+                new_message = (
+                    f'<div class="message">'
+                    f'<span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> '
+                    f'{formatted_text}'
+                    f'</div>'
+                )
                 
                 # Удаляем последний параграф и добавляем новый
                 cursor = self.docs_chat_area.textCursor()
@@ -2230,41 +1765,12 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"ОШИБКА при обновлении потокового сообщения в чате документов: {str(e)}")
 
-    def append_message(self, sender, message, error=False):
-        """Добавление сообщения в историю чата"""
-        # Определяем цвет в зависимости от отправителя
-        if error:
-            color = "#FF0000"  # красный для ошибок
-        elif sender == "Пользователь":
-            color = "#0066CC"  # синий для пользователя
-        else:
-            color = "#009933"  # зеленый для ассистента
-        
-        # Форматируем текущее время
-        timestamp = QDateTime.currentDateTime().toString("HH:mm")
-        
-        # Форматируем сообщение в HTML
-        formatted_message = message.replace("\n", "<br>")
-        html = f'''
-        <div style="margin-bottom: 10px;">
-            <div style="white-space: pre-wrap;">
-                <span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}
-            </div>
-        </div>
-        '''
-        
-        # Добавляем сообщение в историю чата
-        self.chat_history.append(html)
-        
-        # Прокручиваем до конца
-        self.chat_history.moveCursor(QTextCursor.MoveOperation.End)
-
     def append_voice_message(self, sender, message, error=False):
         """Добавление сообщения в историю голосового чата"""
         # Определяем цвет в зависимости от отправителя
         if error:
             color = "#FF0000"  # красный для ошибок
-        elif sender == "Пользователь":
+        elif sender == "Вы":
             color = "#0066CC"  # синий для пользователя
         else:
             color = "#009933"  # зеленый для ассистента
@@ -2272,15 +1778,17 @@ class MainWindow(QMainWindow):
         # Форматируем текущее время
         timestamp = QDateTime.currentDateTime().toString("HH:mm")
         
-        # Форматируем сообщение в HTML
-        formatted_message = message.replace("\n", "<br>")
-        html = f'''
-        <div style="margin-bottom: 10px;">
-            <div style="white-space: pre-wrap;">
-                <span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}
-            </div>
-        </div>
-        '''
+        # Форматируем сообщение, обрабатывая блоки кода
+        formatted_message = self.format_code_blocks(message, prefix="voice_code")
+        
+        # Создаем HTML для сообщения
+        html = (
+            f'<div style="margin-bottom: 10px;">'
+            f'<div style="white-space: pre-wrap;">'
+            f'<span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}'
+            f'</div>'
+            f'</div>'
+        )
         
         # Добавляем сообщение в историю голосового чата
         self.voice_history.append(html)
@@ -2336,6 +1844,432 @@ class MainWindow(QMainWindow):
 
     def streaming_combo_changed(self, index):
         self.streaming_combo.setCurrentIndex(0 if self.current_settings.get("streaming", True) else 1)
+
+    def copy_to_clipboard(self, text):
+        """Копирует текст в буфер обмена с использованием pyperclip"""
+        try:
+            # Используем pyperclip для надежного копирования
+            pyperclip.copy(text)
+            return True
+        except Exception as e:
+            print(f"Ошибка при копировании через pyperclip: {e}")
+            # Попробуем запасной метод через QApplication
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+            return True
+
+    def handle_copy_request(self, url):
+        """Обрабатывает запросы на копирование текста через Python"""
+        if url.path() == "/_copy_to_clipboard":
+            # Получаем данные из запроса
+            query = QUrlQuery(url.query())
+            text = query.queryItemValue("code_text")
+            
+            # URL-декодируем текст
+            import urllib.parse
+            text = urllib.parse.unquote(text)
+            
+            # Декодируем HTML-сущности
+            text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            
+            # Копируем текст с помощью нашей функции
+            success = self.copy_to_clipboard(text)
+            
+            # Показываем уведомление о копировании
+            text_to_display = text[:20] + "..." if len(text) > 20 else text
+            self.statusBar().showMessage(f"Скопировано: {text_to_display}", 2000)
+            
+            return True
+        
+        return False
+
+    def handle_anchor_clicked(self, url):
+        """Обрабатывает клики по ссылкам в QTextEdit"""
+        # Проверяем, является ли это запросом на копирование
+        if url.path() == "/_copy_to_clipboard":
+            # Обрабатываем запрос копирования
+            success = self.handle_copy_request(url)
+            if success:
+                print("Код успешно скопирован в буфер обмена")
+            return
+        
+        # Обработка других типов ссылок может быть добавлена здесь
+        print(f"Обработка клика по ссылке: {url.toString()}")
+
+    def handle_streaming_chunk(self, chunk, accumulated_text):
+        """Обрабатывает фрагменты потоковой генерации ответа"""
+        # Активируем флаг потокового режима, если он ещё не активен
+        if not self.streaming_active:
+            self.streaming_active = True
+        
+        # Определяем, на какой вкладке находится пользователь
+        current_tab = self.tabs.currentWidget()
+        
+        if current_tab == self.chat_tab:
+            # Обновляем сообщение в текстовом чате
+            self.update_streaming_message_in_chat(chunk, accumulated_text)
+        elif current_tab == self.voice_tab:
+            # Обновляем сообщение в голосовом чате
+            self.update_streaming_message_in_voice(chunk, accumulated_text)
+        elif current_tab == self.docs_tab:
+            # Обновляем сообщение в чате документов
+            self.update_streaming_message_in_docs(chunk, accumulated_text)
+    
+    def update_streaming_message_in_chat(self, chunk, accumulated_text):
+        """Обновляет потоковое сообщение в текстовом чате"""
+        # Если это первый фрагмент, удаляем сообщение "Ассистент печатает..."
+        if self.current_stream_message == "":
+            html = self.chat_history.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.chat_history.setHtml(html)
+            
+            # Форматируем сообщение, обрабатывая блоки кода
+            formatted_text = self.format_code_blocks(accumulated_text, prefix="chat_stream_code")
+            
+            # Создаем время
+            timestamp = QDateTime.currentDateTime().toString("HH:mm")
+            
+            # Создаем HTML для нового сообщения 
+            color = "#009933"  # зеленый для ассистента
+            new_message = (
+                f'<div class="message">'
+                f'<span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> '
+                f'{formatted_text}'
+                f'</div>'
+            )
+            
+            # Добавляем сообщение в историю чата
+            self.chat_history.append(new_message)
+            
+            # Сохраняем текущий текст для последующих обновлений
+            self.current_stream_message = accumulated_text
+        else:
+            # Последующие фрагменты - обновляем последнее сообщение
+            try:
+                # Форматируем сообщение, обрабатывая блоки кода
+                formatted_text = self.format_code_blocks(accumulated_text, prefix="chat_stream_code")
+                
+                # Создаем новое сообщение с обновленным текстом
+                color = "#009933"  # зеленый для ассистента
+                timestamp = QDateTime.currentDateTime().toString("HH:mm")
+                
+                new_message = (
+                    f'<div class="message">'
+                    f'<span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> '
+                    f'{formatted_text}'
+                    f'</div>'
+                )
+                
+                # Удаляем последний параграф и добавляем новый
+                cursor = self.chat_history.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
+                                  cursor.position())
+                cursor.removeSelectedText()
+                
+                # Вставляем обновленное сообщение
+                cursor.insertHtml(new_message)
+                
+                # Обновляем сохраненный текст
+                self.current_stream_message = accumulated_text
+                
+                # Прокручиваем вниз
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.chat_history.setTextCursor(cursor)
+            except Exception as e:
+                print(f"ОШИБКА при обновлении потокового сообщения в текстовом чате: {str(e)}")
+    
+    def update_streaming_message_in_voice(self, chunk, accumulated_text):
+        """Обновляет потоковое сообщение в голосовом чате"""
+        # Если это первый фрагмент, удаляем сообщение "Ассистент печатает..."
+        if self.current_stream_message == "":
+            html = self.voice_history.toHtml()
+            html = html.replace('<span style="color: #888888;">Ассистент печатает...</span>', '')
+            self.voice_history.setHtml(html)
+            
+            # Форматируем сообщение, обрабатывая блоки кода
+            formatted_text = self.format_code_blocks(accumulated_text, prefix="voice_stream_code")
+            
+            # Создаем время
+            timestamp = QDateTime.currentDateTime().toString("HH:mm")
+            
+            # Создаем HTML для нового сообщения 
+            color = "#009933"  # зеленый для ассистента
+            new_message = (
+                f'<div class="message">'
+                f'<span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> '
+                f'{formatted_text}'
+                f'</div>'
+            )
+            
+            # Добавляем сообщение в историю чата
+            self.voice_history.append(new_message)
+            
+            # Сохраняем текущий текст для последующих обновлений
+            self.current_stream_message = accumulated_text
+        else:
+            # Последующие фрагменты - обновляем последнее сообщение
+            try:
+                # Форматируем сообщение, обрабатывая блоки кода
+                formatted_text = self.format_code_blocks(accumulated_text, prefix="voice_stream_code")
+                
+                # Создаем новое сообщение с обновленным текстом
+                color = "#009933"  # зеленый для ассистента
+                timestamp = QDateTime.currentDateTime().toString("HH:mm")
+                
+                new_message = (
+                    f'<div class="message">'
+                    f'<span style="font-weight: bold; color: {color};">[{timestamp}] Ассистент:</span> '
+                    f'{formatted_text}'
+                    f'</div>'
+                )
+                
+                # Удаляем последний параграф и добавляем новый
+                cursor = self.voice_history.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor, 
+                                   cursor.position())
+                cursor.removeSelectedText()
+                
+                # Вставляем обновленное сообщение
+                cursor.insertHtml(new_message)
+                
+                # Обновляем сохраненный текст
+                self.current_stream_message = accumulated_text
+                
+                # Прокручиваем вниз
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.voice_history.setTextCursor(cursor)
+            except Exception as e:
+                print(f"ОШИБКА при обновлении потокового сообщения в голосовом чате: {str(e)}")
+
+    def handle_transcription_complete(self, success, text):
+        """Обрабатывает завершение транскрибации"""
+        # Скрываем индикатор прогресса
+        self.transcribe_progress.setValue(0)
+        
+        # Включаем кнопки
+        self.start_transcribe_btn.setEnabled(True)
+        
+        if success:
+            # Отображаем результат
+            self.transcribe_result.setPlainText(text)
+            
+            # Активируем кнопки для копирования и сохранения
+            self.copy_result_btn.setEnabled(True)
+            self.save_result_btn.setEnabled(True)
+        else:
+            # Отображаем сообщение об ошибке
+            QMessageBox.warning(self, "Ошибка", f"Не удалось выполнить транскрибацию: {text}")
+            self.transcribe_result.setPlainText("")
+            
+            # Деактивируем кнопки
+            self.copy_result_btn.setEnabled(False)
+            self.save_result_btn.setEnabled(False)
+    
+    def update_progress_bar(self, value):
+        """Обновляет индикатор прогресса"""
+        self.transcribe_progress.setValue(value)
+
+    def browse_media_file(self):
+        """Выбор медиафайла для транскрибации"""
+        file_dialog = QFileDialog()
+        file_dialog.setNameFilter("Медиафайлы (*.mp3 *.mp4 *.wav *.m4a *.ogg)")
+        
+        if file_dialog.exec():
+            filenames = file_dialog.selectedFiles()
+            if filenames:
+                self.transcribe_input.setText(filenames[0])
+    
+    def start_transcription(self):
+        """Запуск процесса транскрибации"""
+        # Определяем тип источника
+        is_file = self.file_radio.isChecked()
+        is_youtube = self.youtube_radio.isChecked()
+        
+        # Получаем входные данные
+        input_value = self.transcribe_input.text().strip()
+        
+        if not input_value:
+            QMessageBox.warning(self, "Внимание", "Укажите файл или URL для транскрибации")
+            return
+        
+        # Деактивируем кнопку на время обработки
+        self.start_transcribe_btn.setEnabled(False)
+        
+        # Устанавливаем начальный прогресс
+        self.transcribe_progress.setValue(10)
+        
+        # Очищаем результат
+        self.transcribe_result.clear()
+        
+        # Настраиваем транскрайбер
+        self.transcriber.set_model_size(self.model_size_combo.currentText())
+        self.transcriber.set_language(self.language_combo.currentText())
+        
+        # Создаем поток для обработки
+        if is_file:
+            self.transcribe_thread = TranscriptionThread(self.signals, self.transcriber, file_path=input_value)
+        elif is_youtube:
+            self.transcribe_thread = TranscriptionThread(self.signals, self.transcriber, youtube_url=input_value)
+        
+        # Запускаем поток
+        self.transcribe_thread.start()
+    
+    def change_model_size(self, size):
+        """Изменение размера модели транскрибации"""
+        self.transcriber.set_model_size(size)
+    
+    def change_transcription_language(self, language):
+        """Изменение языка транскрибации"""
+        self.transcriber.set_language(language)
+    
+    def copy_transcription(self):
+        """Копирование результата транскрибации в буфер обмена"""
+        text = self.transcribe_result.toPlainText()
+        if text:
+            success = self.copy_to_clipboard(text)
+            if success:
+                QMessageBox.information(self, "Скопировано", "Текст транскрибации скопирован в буфер обмена")
+    
+    def save_transcription(self):
+        """Сохранение результата транскрибации в файл"""
+        text = self.transcribe_result.toPlainText()
+        if not text:
+            QMessageBox.warning(self, "Внимание", "Нет данных для сохранения")
+            return
+            
+        file_dialog = QFileDialog()
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        file_dialog.setNameFilter("Текстовые файлы (*.txt)")
+        file_dialog.setDefaultSuffix("txt")
+        
+        if file_dialog.exec():
+            filenames = file_dialog.selectedFiles()
+            if filenames:
+                try:
+                    with open(filenames[0], 'w', encoding='utf-8') as f:
+                        f.write(text)
+                    QMessageBox.information(self, "Сохранено", f"Текст сохранен в файл:\n{filenames[0]}")
+                except Exception as e:
+                    QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {str(e)}")
+
+    def show_llm_settings(self):
+        """Открывает диалог настроек LLM модели"""
+        dialog = ModelSettingsDialog(self)
+        
+        if dialog.exec():
+            # Получаем новые настройки
+            new_settings = dialog.get_settings()
+            
+            # Применяем настройки к модели
+            update_model_settings(new_settings)
+            
+            # Показываем информацию об успешном обновлении
+            QMessageBox.information(self, "Настройки обновлены", "Настройки LLM модели успешно обновлены")
+    
+    def show_interface_settings(self):
+        """Открывает диалог настроек интерфейса"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Настройки интерфейса")
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Выбор темы
+        theme_layout = QFormLayout()
+        theme_combo = QComboBox()
+        theme_combo.addItems(["Светлая", "Тёмная"])
+        current_theme = self.model_config.config.get("theme", "light")
+        theme_combo.setCurrentIndex(1 if current_theme == "dark" else 0)
+        
+        theme_layout.addRow("Тема интерфейса:", theme_combo)
+        
+        # Кнопка закрытия
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(lambda: dialog.accept())
+        
+        # Кнопки внизу
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(close_button)
+        
+        # Добавляем всё в основной макет
+        layout.addLayout(theme_layout)
+        layout.addStretch()
+        layout.addLayout(buttons_layout)
+        
+        # Сохраняем выбранную тему при закрытии
+        def save_theme():
+            new_theme = "dark" if theme_combo.currentIndex() == 1 else "light"
+            if new_theme != self.model_config.config.get("theme", "light"):
+                self.model_config.config["theme"] = new_theme
+                self.model_config.save_config()
+                self.apply_theme()
+        
+        dialog.accepted.connect(save_theme)
+        
+        dialog.exec()
+    
+    def apply_theme(self):
+        """Применяет выбранную тему к интерфейсу"""
+        theme = self.model_config.config.get("theme", "light")
+        
+        if theme == "dark":
+            app = QApplication.instance()
+            app.setStyleSheet("""
+                QWidget { background-color: #2d2d2d; color: #f0f0f0; }
+                QTextEdit, QLineEdit { background-color: #3d3d3d; color: #f0f0f0; border: 1px solid #555; }
+                QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; }
+                QPushButton:hover { background-color: #0077EE; }
+                QTabWidget::pane { border: 1px solid #555; }
+                QTabBar::tab { background-color: #333; color: #f0f0f0; padding: 8px 12px; margin-right: 2px; }
+                QTabBar::tab:selected { background-color: #444; border-bottom: 2px solid #0078d7; }
+                QGroupBox { border: 1px solid #555; margin-top: 1.5ex; }
+                QHeaderView::section { background-color: #444; color: #f0f0f0; }
+                QComboBox { background-color: #3d3d3d; color: #f0f0f0; border: 1px solid #555; }
+                QCheckBox, QRadioButton { color: #f0f0f0; }
+            """)
+        else:
+            # Светлая тема - используем кастомную тему с синими кнопками
+            app = QApplication.instance()
+            app.setStyleSheet("""
+                QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; }
+                QPushButton:hover { background-color: #0077EE; }
+            """)
+
+    def append_message(self, sender, message, error=False):
+        """Добавление сообщения в историю чата"""
+        # Определяем цвет в зависимости от отправителя
+        if error:
+            color = "#FF0000"  # красный для ошибок
+        elif sender == "Вы":
+            color = "#0066CC"  # синий для пользователя
+        else:
+            color = "#009933"  # зеленый для ассистента
+        
+        # Форматируем текущее время
+        timestamp = QDateTime.currentDateTime().toString("HH:mm")
+        
+        # Форматируем сообщение, обрабатывая блоки кода
+        formatted_message = self.format_code_blocks(message, prefix="chat_code")
+        
+        # Создаем HTML для сообщения
+        html = (
+            f'<div style="margin-bottom: 10px;">'
+            f'<div style="white-space: pre-wrap;">'
+            f'<span style="font-weight: bold; color: {color};">[{timestamp}] {sender}:</span> {formatted_message}'
+            f'</div>'
+            f'</div>'
+        )
+        
+        # Добавляем сообщение в историю чата
+        self.chat_history.append(html)
+        
+        # Прокручиваем до конца
+        self.chat_history.moveCursor(QTextCursor.MoveOperation.End)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

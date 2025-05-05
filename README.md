@@ -39,9 +39,13 @@ cd memoai
 pip install -r requirements.txt
 ```
 
-3. Загрузите языковую модель в формате GGUF и поместите её в директорию `models/`.
+3. Загрузите языковую модель с Hugging Face (https://huggingface.co/models?sort=downloads&search=gguf) в формате GGUF и поместите её в директорию `models/`.
 
 4. Загрузите модель для распознавания речи Vosk (https://alphacephei.com/vosk/models) и распакуйте в директорию `model_small/`.
+
+5. Загрузите Silero TTS для синтеза речи (GitHub: https://github.com/snakers4/silero-models) и распакуйте в директорию `silero_models/`.
+
+6. Загрузите и установите на свой ПК: VB-Cable (https://vb-audio.com/Cable/) и Virtual Audio Cable (https://www.vb-audio.com/Voicemeeter/index.htm) для онлайн транскрибации звука с совещаний.
 
 ## Запуск
 
