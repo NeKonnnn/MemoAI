@@ -4,7 +4,7 @@ import subprocess
 from vosk import Model, KaldiRecognizer
 import wave
 import json
-import pytube
+import pytubefix
 from moviepy.editor import VideoFileClip
 import numpy as np
 import sounddevice as sd
@@ -15,6 +15,7 @@ import zipfile
 import shutil
 from tqdm import tqdm
 import re
+import sys
 
 class Transcriber:
     def __init__(self):
@@ -582,16 +583,45 @@ class Transcriber:
             
             # Добавляем обработку ошибок сети с повтором
             max_retries = 3
+            connection_error = None
+            yt = None
+            
+            # Настройка прокси для обхода возможных блокировок API
+            # Используем только если есть проблемы с соединением
+            proxies = None
+            
             for retry in range(max_retries):
                 try:
-                    yt = pytube.YouTube(url)
-                    break
-                except Exception as retry_err:
-                    if retry < max_retries - 1:
-                        print(f"Ошибка при подключении (попытка {retry+1}/{max_retries}): {retry_err}")
-                        time.sleep(2)  # Пауза перед повторной попыткой
+                    # Создаем объект YouTube с дополнительными параметрами
+                    yt = pytubefix.YouTube(
+                        url,
+                        use_oauth=False,
+                        allow_oauth_cache=True,
+                        proxies=proxies
+                    )
+                    # Проверяем, что можем получить базовую информацию
+                    if yt.title:
+                        break
+                except pytubefix.exceptions.RegexMatchError as e:
+                    # Проблема с форматом URL
+                    return False, f"Неверный формат URL: {str(e)}"
+                except pytubefix.exceptions.VideoUnavailable as e:
+                    # Видео недоступно
+                    return False, f"Видео недоступно: {str(e)}"
+                except (pytubefix.exceptions.PytubeError, Exception) as e:
+                    connection_error = str(e)
+                    if "HTTP Error 400" in connection_error or "Bad Request" in connection_error:
+                        # Возможно, блокировка API, пробуем с другими параметрами
+                        if retry == 0:
+                            print("Получен HTTP Error 400, пробуем альтернативные методы доступа...")
                     else:
-                        return False, f"Не удалось подключиться к YouTube после {max_retries} попыток: {retry_err}"
+                        print(f"Ошибка при подключении (попытка {retry+1}/{max_retries}): {connection_error}")
+                    
+                    # При повторе пытаемся использовать другие параметры
+                    time.sleep(2 * (retry + 1))  # Увеличиваем задержку с каждой попыткой
+            
+            if yt is None:
+                return False, f"Не удалось подключиться к YouTube после {max_retries} попыток: {connection_error}"
             
             # Получаем и выводим информацию о видео
             try:
@@ -607,21 +637,34 @@ class Transcriber:
             self.update_progress(25)
             
             try:
-                # Сначала пробуем прогрессивные потоки (с аудио)
-                video_streams = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution')
+                # Устанавливаем повторы для получения потоков
+                stream = None
+                streams_error = None
                 
-                # Ищем самое качественное видео с аудио
-                stream = video_streams.last()
+                for retry in range(max_retries):
+                    try:
+                        # Сначала пробуем прогрессивные потоки (с аудио)
+                        video_streams = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution')
+                        
+                        # Ищем самое качественное видео с аудио
+                        stream = video_streams.last()
+                        if not stream:
+                            # Если не нашли прогрессивный поток, попробуем любой с аудио
+                            stream = yt.streams.filter(only_audio=False).first()
+                            
+                        if not stream:
+                            # Если всё ещё нет подходящего потока, возьмем только аудио
+                            stream = yt.streams.filter(only_audio=True).first()
+                        
+                        if stream:
+                            break
+                    except Exception as e:
+                        streams_error = str(e)
+                        print(f"Ошибка при получении потоков (попытка {retry+1}/{max_retries}): {streams_error}")
+                        time.sleep(2 * (retry + 1))
+                
                 if not stream:
-                    # Если не нашли прогрессивный поток, попробуем любой с аудио
-                    stream = yt.streams.filter(only_audio=False).first()
-                    
-                if not stream:
-                    # Если всё ещё нет подходящего потока, возьмем только аудио
-                    stream = yt.streams.filter(only_audio=True).first()
-                    
-                if not stream:
-                    return False, "Не удалось найти подходящий поток для загрузки"
+                    return False, f"Не удалось найти подходящий поток для загрузки: {streams_error}"
                 
                 print(f"Выбран поток: {getattr(stream, 'resolution', 'аудио')}, {getattr(stream, 'fps', 'N/A')}fps")
                 self.update_progress(30)
@@ -662,7 +705,7 @@ class Transcriber:
             return True, video_path
         except Exception as e:
             print(f"Ошибка при загрузке видео с YouTube: {str(e)}")
-            return False, f"Ошибка при загрузке видео: {str(e)}"
+            return False, f"Ошибка при загрузке видео с YouTube: {str(e)}"
             
     def normalize_youtube_url(self, url):
         """Нормализует URL YouTube для корректной обработки"""

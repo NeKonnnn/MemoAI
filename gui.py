@@ -969,6 +969,24 @@ class MainWindow(QMainWindow):
         settings_group = QGroupBox("Настройки транскрибации")
         settings_layout = QFormLayout(settings_group)
         
+        # Стилизуем заголовок группы
+        settings_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #3AA8FF;
+                font-size: 14px;
+                margin-top: 3ex;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                top: -1ex;
+                padding: 0 8px;
+                background-color: #2d2d2d;
+            }
+        """)
+        
         # Выбор размера модели
         self.model_size_combo = QComboBox()
         self.model_size_combo.addItems(["tiny", "base", "small", "medium", "large"])
@@ -988,6 +1006,24 @@ class MainWindow(QMainWindow):
         # Панель источников
         source_group = QGroupBox("Источник для транскрибации")
         source_layout = QVBoxLayout(source_group)
+        
+        # Стилизуем заголовок группы
+        source_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #3AA8FF;
+                font-size: 14px;
+                margin-top: 3ex;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                top: -1ex;
+                padding: 0 8px;
+                background-color: #2d2d2d;
+            }
+        """)
         
         # Кнопки выбора источника
         self.source_radio_group = QButtonGroup(self)
@@ -1034,6 +1070,24 @@ class MainWindow(QMainWindow):
         result_group = QGroupBox("Результаты транскрибации")
         result_layout = QVBoxLayout(result_group)
         
+        # Стилизуем заголовок группы
+        result_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #3AA8FF;
+                font-size: 14px;
+                margin-top: 3ex;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                top: -1ex;
+                padding: 0 8px;
+                background-color: #2d2d2d;
+            }
+        """)
+        
         self.transcribe_result = QTextEdit()
         self.transcribe_result.setReadOnly(True)
         result_layout.addWidget(self.transcribe_result)
@@ -1054,7 +1108,7 @@ class MainWindow(QMainWindow):
         self.transcribe_layout.addWidget(result_group)
     
     def setup_online_transcribe_tab(self):
-        """Настройка вкладки для онлайн-транскрибации совещаний"""
+        """Настройка вкладки для онлайн-транскрибации"""
         # Создаем вкладку
         self.online_transcribe_tab = QWidget()
         self.online_transcribe_layout = QVBoxLayout(self.online_transcribe_tab)
@@ -1063,8 +1117,26 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.online_transcribe_tab, QIcon("assets/online.png"), "Совещания")
         
         # Верхняя панель с настройками
-        settings_group = QGroupBox("Настройки записи совещания")
+        settings_group = QGroupBox("Настройки для транскрибации")
         settings_layout = QVBoxLayout(settings_group)
+        
+        # Стилизуем заголовок группы
+        settings_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #3AA8FF;
+                font-size: 14px;
+                margin-top: 3ex;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                top: -1ex;
+                padding: 0 8px;
+                background-color: #2d2d2d;
+            }
+        """)
         
         # Настройки источников аудио
         sources_form = QFormLayout()
@@ -1097,7 +1169,7 @@ class MainWindow(QMainWindow):
                           "2. Установите виртуальный аудиокабель (например, VB-Cable)\n"
                           "3. Выберите соответствующее устройство в списке выше")
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #666; font-style: italic;")
+        info_label.setStyleSheet("color: #CCC; font-style: italic;")
         sources_form.addRow(info_label)
         
         # Кнопки управления записью
@@ -1124,6 +1196,24 @@ class MainWindow(QMainWindow):
         # Область для отображения транскрипции в реальном времени
         transcript_group = QGroupBox("Стенограмма совещания")
         transcript_layout = QVBoxLayout(transcript_group)
+        
+        # Стилизуем заголовок группы
+        transcript_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #3AA8FF;
+                font-size: 14px;
+                margin-top: 3ex;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                top: -1ex;
+                padding: 0 8px;
+                background-color: #2d2d2d;
+            }
+        """)
         
         self.online_transcript_area = QTextEdit()
         self.online_transcript_area.setReadOnly(True)
@@ -1548,8 +1638,23 @@ class MainWindow(QMainWindow):
         current_model = self.model_config.get_current_model()
         model_name = current_model["name"] if current_model else "Нет"
         
+        # Получаем дополнительную информацию о модели если она загружена
+        model_info = get_model_info()
+        model_info_text = f"Текущая модель:\n{model_name}"
+        
+        # Добавляем информацию о параметрах модели если она загружена
+        if model_info["loaded"] and model_info["metadata"]:
+            metadata = model_info["metadata"]
+            # Добавляем базовую информацию если она доступна
+            if "general.architecture" in metadata:
+                model_info_text += f"\nАрхитектура: {metadata.get('general.architecture', 'Неизвестно')}"
+            if "general.size_label" in metadata:
+                model_info_text += f"\nРазмер: {metadata.get('general.size_label', 'Неизвестно')}"
+            if "llama.context_length" in metadata:
+                model_info_text += f"\nКонтекст: {metadata.get('llama.context_length', model_info.get('n_ctx', 'Неизвестно'))}"
+        
         # Обновляем текст метки
-        self.model_info_label.setText(f"Текущая модель:\n{model_name}")
+        self.model_info_label.setText(model_info_text)
     
     def add_model(self):
         """Добавление новой модели"""
@@ -2509,10 +2614,23 @@ class MainWindow(QMainWindow):
                 QTabWidget::pane { border: 1px solid #555; }
                 QTabBar::tab { background-color: #333; color: #f0f0f0; padding: 8px 12px; margin-right: 2px; }
                 QTabBar::tab:selected { background-color: #444; border-bottom: 2px solid #0078d7; }
-                QGroupBox { border: 1px solid #555; margin-top: 1.5ex; }
+                QGroupBox { 
+                    border: 1px solid #555; 
+                    margin-top: 3ex; 
+                }
+                QGroupBox::title { 
+                    color: #3AA8FF; 
+                    background-color: #2d2d2d; 
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 8px;
+                    top: -1ex;
+                    left: 10px;
+                }
                 QHeaderView::section { background-color: #444; color: #f0f0f0; }
                 QComboBox { background-color: #3d3d3d; color: #f0f0f0; border: 1px solid #555; }
                 QCheckBox, QRadioButton { color: #f0f0f0; }
+                QLabel { color: #f0f0f0; }
             """)
         else:
             # Светлая тема - используем кастомную тему с синими кнопками
@@ -2520,6 +2638,18 @@ class MainWindow(QMainWindow):
             app.setStyleSheet("""
                 QPushButton { background-color: #0066CC; color: white; border: 1px solid #0055AA; padding: 5px; border-radius: 6px; }
                 QPushButton:hover { background-color: #0077EE; }
+                QGroupBox { 
+                    margin-top: 3ex; 
+                }
+                QGroupBox::title { 
+                    color: #0078d7; 
+                    font-weight: bold;
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 8px;
+                    top: -1ex;
+                    left: 10px;
+                }
             """)
 
     def append_message(self, sender, message, error=False):
@@ -2685,26 +2815,29 @@ class MainWindow(QMainWindow):
             metadata = model_info["metadata"]
             if metadata:
                 # Базовая информация о модели
-                metadata_str = f"Название: {metadata.get('general.name', 'Неизвестно')}\n"
-                metadata_str += f"Архитектура: {metadata.get('general.architecture', 'Неизвестно')}\n"
-                metadata_str += f"Размер: {metadata.get('general.size_label', 'Неизвестно')}\n"
-                metadata_str += f"Организация: {metadata.get('general.organization', 'Неизвестно')}\n"
-                metadata_str += f"Версия: {metadata.get('general.version', 'Неизвестно')}\n"
-                metadata_str += f"Контекстное окно: {metadata.get('llama.context_length', model_info.get('n_ctx', 'Неизвестно'))}\n"
-                metadata_str += f"Размер эмбеддингов: {metadata.get('llama.embedding_length', 'Неизвестно')}\n"
-                metadata_str += f"Количество слоёв: {metadata.get('llama.block_count', 'Неизвестно')}\n"
-                metadata_str += f"Количество GPU слоёв: {model_info.get('n_gpu_layers', 0)}\n"
-                metadata_str += f"Путь к файлу: {model_info['path']}\n"
-                metadata_str += f"Режим совместимости: {'Включен' if model_settings.get('legacy_api', False) else 'Выключен'}\n\n"
+                metadata_str = f"<b>Название:</b> {metadata.get('general.name', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Архитектура:</b> {metadata.get('general.architecture', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Размер:</b> {metadata.get('general.size_label', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Организация:</b> {metadata.get('general.organization', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Версия:</b> {metadata.get('general.version', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Контекстное окно:</b> {metadata.get('llama.context_length', model_info.get('n_ctx', 'Неизвестно'))}<br>"
+                metadata_str += f"<b>Размер эмбеддингов:</b> {metadata.get('llama.embedding_length', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Количество слоёв:</b> {metadata.get('llama.block_count', 'Неизвестно')}<br>"
+                metadata_str += f"<b>Количество GPU слоёв:</b> {model_info.get('n_gpu_layers', 0)}<br>"
+                metadata_str += f"<b>Путь к файлу:</b> {model_info['path']}<br>"
+                metadata_str += f"<b>Режим совместимости:</b> {'Включен' if model_settings.get('legacy_api', False) else 'Выключен'}<br>"
                 
-                # Полные метаданные
-                metadata_str += "Полные метаданные:\n"
-                for key, value in metadata.items():
-                    metadata_str += f"{key}: {value}\n"
-            else:
-                metadata_str = "Метаданные недоступны"
+                # Дополнительные метаданные
+                if len(metadata) > 10:
+                    metadata_str += "<br><b>Дополнительные метаданные:</b><br>"
+                    for key, value in metadata.items():
+                        if not key.startswith(("general.", "llama.")):
+                            metadata_str += f"<b>{key}:</b> {value}<br>"
             
-            metadata_text.setText(metadata_str)
+                metadata_text.setHtml(metadata_str)
+            else:
+                metadata_text.setPlainText(f"Метаданные недоступны\nПуть к файлу: {model_info['path']}")
+                
             layout.addWidget(metadata_text)
             
             # Добавляем кнопки для управления моделью

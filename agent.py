@@ -341,25 +341,73 @@ def get_model_info():
         }
     
     try:
+        # Создаем базовую структуру метаданных
+        metadata = {
+            "general.name": "Неизвестно",
+            "general.architecture": "Неизвестно",
+            "general.size_label": "Неизвестно"
+        }
+        
+        # Пытаемся получить информацию через метод model_metadata
         try:
-            metadata = llm.model_metadata()
-        except AttributeError:
-            # Обработка случая, когда метод model_metadata отсутствует
-            print("Метод model_metadata не найден, возвращаем базовые метаданные")
-            metadata = {"general.name": "Неизвестно", "general.architecture": "Неизвестно"}
+            if hasattr(llm, 'model_metadata'):
+                model_meta = llm.model_metadata()
+                metadata.update(model_meta)
+        except Exception as e:
+            print(f"Предупреждение: Не удалось получить метаданные модели: {e}")
+        
+        # Информация о контексте
+        n_ctx = 4096  # значение по умолчанию
+        try:
+            if hasattr(llm, 'n_ctx'):
+                if callable(llm.n_ctx):
+                    n_ctx = llm.n_ctx()
+                else:
+                    n_ctx = llm.n_ctx
+        except Exception as e:
+            print(f"Предупреждение: Не удалось получить размер контекста: {e}")
+        
+        # Слои GPU
+        n_gpu_layers = 0
+        try:
+            if hasattr(llm, 'params') and hasattr(llm.params, 'n_gpu_layers'):
+                n_gpu_layers = llm.params.n_gpu_layers
+        except Exception as e:
+            print(f"Предупреждение: Не удалось получить количество GPU слоев: {e}")
+        
+        # Получаем тип модели и имя файла для более информативного отображения
+        model_filename = os.path.basename(MODEL_PATH)
+        if "general.architecture" not in metadata or metadata["general.architecture"] == "Неизвестно":
+            # Пытаемся определить архитектуру по имени файла
+            if "llama" in model_filename.lower():
+                metadata["general.architecture"] = "LLaMA"
+            elif "mistral" in model_filename.lower():
+                metadata["general.architecture"] = "Mistral"
+            elif "qwen" in model_filename.lower():
+                metadata["general.architecture"] = "Qwen"
+            elif "phi" in model_filename.lower():
+                metadata["general.architecture"] = "Phi"
+            elif "gemma" in model_filename.lower():
+                metadata["general.architecture"] = "Gemma"
+        
+        # Возвращаем собранную информацию
         return {
             "loaded": True,
             "metadata": metadata,
             "path": MODEL_PATH,
-            "n_ctx": llm.n_ctx(),
-            "n_gpu_layers": llm.params.n_gpu_layers
+            "n_ctx": n_ctx,
+            "n_gpu_layers": n_gpu_layers
         }
     except Exception as e:
         print(f"Ошибка при получении информации о модели: {e}")
         return {
             "loaded": True,
             "error": str(e),
-            "path": MODEL_PATH
+            "path": MODEL_PATH,
+            "metadata": {
+                "general.name": os.path.basename(MODEL_PATH),
+                "general.architecture": "Неизвестно"
+            }
         }
 
 def prepare_prompt(text, system_prompt=None):
