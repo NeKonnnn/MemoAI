@@ -1,6 +1,6 @@
 {
-  "context_size": 2048,
-  "output_tokens": 1024,
+  "context_size": 4096,
+  "output_tokens": 2048,
   "batch_size": 512,
   "n_threads": 2,
   "use_mmap": true,

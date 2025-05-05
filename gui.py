@@ -797,7 +797,7 @@ class MainWindow(QMainWindow):
         self.sidebar_layout.addWidget(model_info_button)
         
         # Кнопка настроек голосового режима
-        voice_button = QPushButton("Голосовой режим")
+        voice_button = QPushButton("Голос Ассистента")
         voice_button.setMinimumHeight(40)
         voice_button.clicked.connect(self.show_voice_settings)
         self.sidebar_layout.addWidget(voice_button)
@@ -1146,6 +1146,15 @@ class MainWindow(QMainWindow):
         self.mic_checkbox.setChecked(True)
         sources_form.addRow("Записывать микрофон:", self.mic_checkbox)
         
+        # Выбор устройства для микрофона
+        mic_devices_layout = QHBoxLayout()
+        self.mic_device_combo = QComboBox()
+        
+        mic_devices_layout.addWidget(QLabel("Устройство микрофона:"))
+        mic_devices_layout.addWidget(self.mic_device_combo)
+        
+        sources_form.addRow("", mic_devices_layout)
+        
         # Чекбокс для системного звука
         self.system_audio_checkbox = QCheckBox("Записывать аудио системы (голоса собеседников)")
         self.system_audio_checkbox.setChecked(True)
@@ -1243,14 +1252,16 @@ class MainWindow(QMainWindow):
         """Обновление списка аудиоустройств"""
         try:
             self.system_device_combo.clear()
+            self.mic_device_combo.clear()
             
             import sounddevice as sd
             devices = sd.query_devices()
             
+            # Заполняем устройства для системного звука
             for i, device in enumerate(devices):
                 if device['max_input_channels'] > 0:  # Только устройства с входными каналами
                     device_name = device['name']
-                    is_system = any(keyword in device_name for keyword in ['CABLE', 'Mix', 'Loopback', 'VAC', 'VB-Audio'])
+                    is_system = any(keyword in device_name.lower() for keyword in ['cable', 'mix', 'микшер', 'loopback', 'vac', 'vb-audio'])
                     
                     # Добавляем индикатор для устройств, которые могут захватывать системный звук
                     if is_system:
@@ -1258,11 +1269,25 @@ class MainWindow(QMainWindow):
                     else:
                         self.system_device_combo.addItem(device_name, i)
             
-            # Выбираем первое "системное" устройство, если есть
+            # Заполняем устройства для микрофона
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:  # Только устройства с входными каналами
+                    device_name = device['name']
+                    is_system = any(keyword in device_name.lower() for keyword in ['cable', 'mix', 'микшер', 'loopback', 'vac', 'vb-audio'])
+                    
+                    # Пропускаем системные устройства для выбора микрофона
+                    if not is_system:
+                        self.mic_device_combo.addItem(device_name, i)
+            
+            # Выбираем первое "системное" устройство для системного звука, если есть
             for i in range(self.system_device_combo.count()):
                 if "✓" in self.system_device_combo.itemText(i):
                     self.system_device_combo.setCurrentIndex(i)
                     break
+                    
+            # Выбираем первый микрофон, если есть
+            if self.mic_device_combo.count() > 0:
+                self.mic_device_combo.setCurrentIndex(0)
                     
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось получить список аудиоустройств: {str(e)}")
@@ -1281,16 +1306,24 @@ class MainWindow(QMainWindow):
         system_device = None
         if capture_system and self.system_device_combo.currentData() is not None:
             system_device = self.system_device_combo.currentData()
+            
+        # Получаем выбранное устройство для микрофона
+        mic_device = None
+        if capture_mic and self.mic_device_combo.currentData() is not None:
+            mic_device = self.mic_device_combo.currentData()
         
         try:
             # Очищаем текстовую область
             self.online_transcript_area.clear()
             
             # Запускаем транскрибацию
-            success, message = self.online_transcriber.start_transcription(
+            success = self.online_transcriber.start_transcription(
                 results_callback=self.handle_real_time_transcript, 
                 capture_mic=capture_mic, 
-                capture_system=capture_system
+                capture_system=capture_system,
+                system_device=system_device,
+                mic_device=mic_device,
+                use_wasapi=True  # Используем улучшенную запись через WASAPI
             )
             
             if success:
@@ -1300,6 +1333,7 @@ class MainWindow(QMainWindow):
                 self.mic_checkbox.setEnabled(False)
                 self.system_audio_checkbox.setEnabled(False)
                 self.system_device_combo.setEnabled(False)
+                self.mic_device_combo.setEnabled(False)
                 self.refresh_audio_devices_btn.setEnabled(False)
                 
                 # Добавляем сообщение о начале записи
@@ -1308,6 +1342,14 @@ class MainWindow(QMainWindow):
                     "speaker": "Система",
                     "text": "Запись совещания началась. Говорите в микрофон."
                 })
+                
+                # Если используется новый метод записи, добавляем дополнительную информацию
+                if hasattr(self.online_transcriber, 'using_system_recorder') and self.online_transcriber.using_system_recorder:
+                    self.append_online_transcript({
+                        "time": QDateTime.currentDateTime().toString("HH:mm:ss"),
+                        "speaker": "Система",
+                        "text": "Используется улучшенная запись системного звука. Голоса участников будут распознаны."
+                    })
             else:
                 QMessageBox.warning(self, "Ошибка", f"Не удалось запустить транскрибацию: {message}")
                 
@@ -1360,6 +1402,7 @@ class MainWindow(QMainWindow):
             self.mic_checkbox.setEnabled(True)
             self.system_audio_checkbox.setEnabled(True)
             self.system_device_combo.setEnabled(True)
+            self.mic_device_combo.setEnabled(True)
             self.refresh_audio_devices_btn.setEnabled(True)
             
             # Добавляем сообщение о завершении записи
